@@ -1,0 +1,1562 @@
+---
+title: "Placenta_hg38_mRNA"
+author: "Melanie Smith"
+date: "21/05/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE,
+    cache = FALSE,
+    fig.align = "center",
+    results = "hide"
+)
+
+```
+
+# Load required libraries
+
+```{r load Libraries}
+
+library(AnnotationHub)
+library(plyr)
+library(reshape2)
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(edgeR)
+library(pander)
+library(readxl)
+library(magrittr)
+library(plotly)
+library(ggplot2)
+library(ggbeeswarm)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(ggpubr)
+# library(preprocessCore)
+library(dendextend)
+# library(sva)
+# library(quantro)
+library(PCAtools)
+library(here)
+
+## UDFs
+# function to negate magrittr::%in%
+`%notin%` <- Negate(`%in%`)
+# function (x) to count the number of non-zero records in each column (ie per sample)
+nonzero <- function(x) sum(x != 0)
+```
+
+### import Gene-level counts
+
+```{r}
+
+# import the counts table
+grch38_mRNA_placenta_counts <- read_delim(file = "rawData/Bulk_RNAseq_hg38/all.stranded.S2.count",
+                                          delim = "\t",
+                                          comment = "#")
+
+# tidy up the sample IDs
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\cancer\\/storage\\/alignments\\/CORE\\/placenta\\/hg38\\_STAR_bam\\/", "", colnames(grch38_mRNA_placenta_counts))
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\.Aligned\\.sortedByCoord\\.out\\.bam", "", colnames(grch38_mRNA_placenta_counts))
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\/", "", colnames(grch38_mRNA_placenta_counts))
+
+# Preview
+grch38_mRNA_placenta_counts %>% head
+dim(grch38_mRNA_placenta_counts)
+
+# grab chromosome informtion for later
+chromosome <- grch38_mRNA_placenta_counts %>% 
+  dplyr::select(., Geneid, Chr) %>% 
+  transform(., test=do.call(rbind, strsplit(Chr, ';', fixed=TRUE)), stringsAsFactors=FALSE) %>% 
+  dplyr::select(., gene_id = Geneid, chromosome = test.1)
+
+# import metadata and make a new samplename_flowcell ID
+placenta_meta <- read_csv("cleanData/PlacentaGroup_Sample_information.csv") %>% 
+  dplyr::mutate(., name_flowCell = paste(samplename, flowCell, sep = "_")) %>% 
+  dplyr::arrange(., name_flowCell)
+
+# set factor levels for outcomes
+placenta_meta$Outcome <- factor(placenta_meta$Outcome, c("Control", "PE"))
+
+# Drop the columns we don't need anymore
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>% 
+  tibble::column_to_rownames("Geneid") %>% 
+  dplyr::select(., -Chr, -Start, -End, -Strand, -Length)
+
+# remove rows that contain all zero counts
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts[rowSums(grch38_mRNA_placenta_counts[])>0,]
+
+# subset to keep only protein coding genes
+# grch38_mRNA_placenta_counts <- subset(grch38_mRNA_placenta_counts,
+#                                       rownames(grch38_mRNA_placenta_counts) %in% protein_coding$gene_id)
+
+# # subset to keep only genes with an entrez id
+# grch38_mRNA_placenta_counts <- subset(grch38_mRNA_placenta_counts,
+#                                       rownames(grch38_mRNA_placenta_counts) %in% entrez_id$gene_id)
+
+# set factor levels for outcomes
+placenta_meta$Outcome <- factor(placenta_meta$Outcome, c("Control", "PE"))
+
+# vector of duplicated samples (repeat measures; text annotations on PCA plots if needed)
+duplicate <- data.frame(name_flowCell = c("SCP4913_C2BK8ACXX", "SCP4913_CDN0JANXX", "SCP4733_C2BK8ACXX", "SCP4733_CDN0JANXX", "SCP4538_C9FNFANXX", "SCP4538_CDN0JANXX", "SCP4536_C2BK8ACXX", "SCP4536_CDN0JANXX", "SCP4319_C2BK8ACXX", "SCP4319_CDN0JANXX", "SCP4157_C9WE0ANXX", "SCP4157_CDN0JANXX", "SCP3954_C2BK8ACXX", "SCP3954_CDN0JANXX", "SCP3929_C2BK8ACXX", "SCP3929_CDN0JANXX", "SCP3492_C9FNFANXX", "SCP3492_CDN0JANXX"))
+
+# reorder the counts to match the metadata & drop samples (PAC and SRR) not in metadata sheet
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts[,placenta_meta$otherID]
+colnames(grch38_mRNA_placenta_counts) <- placenta_meta$name_flowCell
+
+```
+
+# Gene level annotation information
+
+The two methods here are Annotation Hub and Biomart. I've found Biomart to be very inconsitent lately which is why Annotation Hub is used here.
+
+```{r eval=FALSE}
+
+# Retrieve gene annotation information from AnnotationHub
+# Load annotation hub
+# ah <- AnnotationHub()
+# 
+# # Search for the correct Ensembl gene annotation
+# query(ah, c("Homo sapiens", "ensembl", "GRCh38"))
+# 
+# # Using Ensembl release (hg18)
+# ensDb_38 <- ah[["AH78783"]]
+# genes_38 <- genes(ensDb_38)
+# # pull the info I want
+# genes_38 <- genes_38@elementMetadata
+# genes_38 <- genes_38[, c("gene_id", "gene_name", "gene_biotype", "entrezid")]
+
+# saveRDS(genes_38, file = here("cleanData/genes_38.Rds"))
+
+genes_38 <- readRDS(file ="cleanData/genes_38.Rds")
+
+# create an object of protein coding genes
+protein_coding <- dplyr::filter(data.frame(genes_38), gene_biotype == "protein_coding")
+rownames(protein_coding) <- protein_coding$gene_id
+
+# create an object for genes with an entrez gene ID
+entrez_id <- data.frame(genes_38)[!is.na(genes_38$entrezid), ]
+rownames(entrez_id) <- entrez_id$gene_id
+
+# Retrieve gene annotation information from BioMart
+# ## default mirror
+ensembl <- biomaRt::useEnsembl(biomart = "ensembl",
+                               dataset = "hsapiens_gene_ensembl",
+                               mirror = "www")
+
+# pull the information from biomart
+geneInfo <- biomaRt::getBM(mart = ensembl,
+                           attributes = c("ensembl_gene_id", "chromosome_name",
+                                "hgnc_symbol", "entrezgene_id", "gene_biotype", 
+                                "go_linkage_type"),
+                           filters = c("ensembl_gene_id",
+                                       "with_entrezgene"),
+                           values = list("ensembl_gene_id" = rownames(grch38_mRNA_placenta_counts),
+                                         "with_entrezgene" = TRUE)
+                           )
+
+```
+
+## Plot read raw counts
+
+```{r plot raw gene counts}
+
+# Quick plot to look at the sum of raw counts for each sample
+plotData_rawReads <- grch38_mRNA_placenta_counts %>% 
+  colSums(.) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column() %>%
+  set_colnames(c("sample", "totalCounts")) %>% 
+  arrange(., totalCounts)
+
+ggplot(data = plotData_rawReads,
+       aes(x=reorder(sample, totalCounts),
+           y=totalCounts,
+           colour=totalCounts<9000000)) +
+  geom_point(size=5) +
+  scale_colour_manual(name='Read count\nthreshold',
+                      values=setNames(c('red','green'),
+                                      c(TRUE, FALSE))) +
+  geom_hline(yintercept=9000000,
+             show.legend=FALSE,
+             linetype="dotted",
+             colour="red") +
+  geom_text_repel(data=dplyr::filter(plotData_rawReads,
+                                     totalCounts<9000000),
+                  aes(label=sample),
+                  show.legend=FALSE,
+                  max.overlaps=Inf) +
+  ggtitle("Raw counts placenta - all samples\n(hg38)") +
+  theme_bw(base_size=16) +
+  labs(title="Library size",
+       subtitle="Raw mRNA read counts in placenta",
+       x="Samplename",
+       y="mRNA read counts") +
+  theme(axis.text.x=element_text(angle=270,
+                                 hjust=1.5,
+                                 colour="black",
+                                 size=12),
+        axis.text.y = element_text(angle=0,
+                                   colour="black",
+                                   size=14))
+
+# create object containing samples fail read depth QC
+QC_Remove <- c("SCP4060_CDN0JANXX", "SCP4010_CDN0JANXX")
+# QC_Remove <- c("SCP4060_CDN0JANXX", "SCP4010_CDN0JANXX", "SCP4157_CDN0JANXX")
+
+# remove too small samples from the counts
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>%
+  dplyr::select(., -all_of(QC_Remove))
+
+# remove the too small samples from the metadata
+placenta_meta <- subset(placenta_meta, name_flowCell %notin% QC_Remove)
+
+# create object containing samples fail read depth QC
+EOPE_Remove <- c("SCP3492_CDN0JANXX", "SCP3492_C9FNFANXX")
+
+# remove EOPE sample
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>%
+  dplyr::select(., -all_of(EOPE_Remove))
+
+# remove EOPE sample
+placenta_meta <- subset(placenta_meta, name_flowCell %notin% EOPE_Remove)
+
+```
+
+## MT Genes
+
+We're not interested in mitochondial genes here so these will be removed.
+Y-chromosome genes only present in the male samples will also be removed
+
+```{r remove MT genes}
+
+# create a table with only MT encoded genes
+MTgenes <- geneInfo %>% 
+  dplyr::filter(., chromosome_name == "MT" | chromosome_name == "Y")
+
+# drop these MT genes from the count table
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts[rownames(grch38_mRNA_placenta_counts) %notin% MTgenes$ensembl_gene_id,]
+
+```
+
+## Sex chromosome genes
+
+The sex chromosomes (XX female and XY male) may be a source of bias in the analyses here. However, being that the intention is to determine what the sex differences in transcripts between male and female, as well as PE and control, I will keep the sex chromosomes in as part of this workflow. First, we need to establish what the sex chromosomes are using the chromosome information gathered from the original count table. Note - genes on the Y chromosome will only be present in the male samples. I will filter them seperately to the autosomal genes as given the number of males - they will not pass the minimum group threshold.
+
+```{r find the sex chromosome genes}
+
+no_sex_chr <- data.frame(dplyr::filter(
+  chromosome, chromosome %notin% c("chrX", "chrY"))[,1]) %>%
+  set_colnames(., "gene_name") %>% 
+  subset(., gene_name %in% rownames(grch38_mRNA_placenta_counts))
+no_sex_chr$gene_name <- as.character(no_sex_chr$gene_name)
+# convert back to a vector so I can overwrite the colnames in the counts table
+no_sex_chr <- no_sex_chr[,]
+
+only_sex_chr <- data.frame(dplyr::filter(
+  chromosome, chromosome %in% c("chrX", "chrY"))) %>%
+  set_colnames(., c("gene_name", "chromosome")) %>%
+  subset(., gene_name %in% rownames(grch38_mRNA_placenta_counts))
+only_sex_chr$gene_name <- as.character(only_sex_chr$gene_name)
+# convert back to a vector so I can overwrite the colnames in the counts table
+only_sex_chr <- only_sex_chr[,]
+
+onlyY <- data.frame(dplyr::filter(
+  chromosome, chromosome == "chrY")) %>%
+  set_colnames(., c("gene_name", "chromosome")) %>%
+  subset(., gene_name %in% rownames(grch38_mRNA_placenta_counts))
+onlyY$gene_name <- as.character(onlyY$gene_name)
+# convert back to a vector so I can overwrite the colnames in the counts table
+onlyY <- onlyY[,]
+
+```
+
+# Establish DGEList object #
+ 
+```{r DGEList mRNA}
+
+# put the ensemble gene IDs into column 1
+counts <- grch38_mRNA_placenta_counts %>%
+  tibble::rownames_to_column() %>%
+  left_join(., entrez_id, by = c("rowname"="gene_id")) %>%
+  tibble::column_to_rownames()
+
+# establish the DGEList
+DGElist_mRNA_38 <- DGEList(counts = counts %>% dplyr::select(starts_with(c("SCP", "STP"))),
+                           samples = placenta_meta,
+                           group = placenta_meta$group,
+                           genes = counts %>% dplyr::select(-starts_with(c("SCP", "STP"))))
+
+# set max digits
+options(digits=3)
+# take a look at the metadata
+head(DGElist_mRNA_38$samples)
+
+# view head and tail of gene list
+head(DGElist_mRNA_38$genes)
+tail(DGElist_mRNA_38$genes)
+
+# drop genes that don't have an official gene symbol
+DGElist_mRNA_38 <- DGElist_mRNA_38[!is.na(DGElist_mRNA_38$genes$gene_name), ]
+
+# check for any remaining NAs
+with(DGElist_mRNA_38$genes, is.na(gene_name)) %>% table()
+# check the dimensions
+dim(DGElist_mRNA_38)
+
+```
+
+## Keep only flowcell #CDN0JANXX
+
+This workflow is written to test for differential expression between my control and PE groups.
+To minimise any technical variation introduced by multiple sequencing batches, I am keeping only the most recent sequencing run _CDN0JANXX_.
+We created this experiement specifically to test the PE question and balanced the _SCOPE_ and _STOP_ cohort numbers.
+
+```{r}
+
+# create an object of sample names that belong to flowcell CDN0JANXX
+CDN0JANXX <- dplyr::filter(DGElist_mRNA_38$samples, flowCell == "CDN0JANXX")
+
+# subset the DGEList object such that only flowcell CDN0JANXX remains
+DGElist_mRNA_38 <- DGElist_mRNA_38[, CDN0JANXX$name_flowCell]
+
+# check the dimensions
+dim(DGElist_mRNA_38)
+
+```
+
+# Filter biological noise and plot
+
+This step removes genes that fail the first basic filtering step. Here `filterCPM` sets a minimum CPM value and `numSamples` set a minimum number of samples where the gene is present at the given CPM value. You can set the `numSamples` manually or count the number of samples in the *PE* group (which is the smallest group) to set this number.
+
+```{r filter_bionoise}
+
+# filter threshold
+filterCPM <- 2
+numSamples <- dim(dplyr::filter(DGElist_mRNA_38$samples, Outcome == "PE" & Sex == "M"))[1]
+# numSamples <- dim(dplyr::filter(DGElist_mRNA_38$samples, Outcome == "PE"))[1] # (number total PE)
+
+# calculate the cpm value of a read count of 10 given the mean library size
+# (to be used in the keep.genes)
+cpm(10, mean(DGElist_mRNA_38$samples$lib.size))
+# new df of unfiltered cpm for the reduced DGEList
+rawCpm_mRNA <- cpm(DGElist_mRNA_38)
+# new df of unfiltered log 2 cpm for the reduced DGEList
+rawlcpm_mRNA <- cpm(DGElist_mRNA_38, log = TRUE, prior.count = 3)
+
+# remove low expressed genes (filterCPM in numSamples PE)
+keep.exprs <- rowSums(rawCpm_mRNA > filterCPM) >= numSamples
+
+# Perform the filtering step and recalculate the TMM normalisation factors for each library.
+DGElist_mRNA_38 <- DGElist_mRNA_38[keep.exprs,,keep.lib.sizes = FALSE]
+
+dim(DGElist_mRNA_38)
+
+## The density of log-CPM values for pre-filtered data
+# (A) and post-filtered data
+# (B) are shown for each sample.
+## Dotted vertical lines mark the log-CPM of 1 threshold
+# (equivalent to a CPM value of 2) used in the filtering step.
+nsamples <- ncol(DGElist_mRNA_38)
+col_mRNA <- colorRampPalette(brewer.pal(11,"Spectral"))(ncol(DGElist_mRNA_38))
+par(mfrow=c(1,2))
+plot(
+  density(
+    rawlcpm_mRNA[,1]
+  ),
+  col = col_mRNA[1],
+  lwd = 2,
+  ylim = c(0, 0.20),
+  las = 2,
+  main = "",
+  xlab = "")
+title(main = "A. DGElist_mRNA_38 Unfiltered data", xlab = "Log-cpm")
+abline(v = 1, lty = 3)
+for (i in 1:nsamples){
+  den <- density(rawlcpm_mRNA[,i])
+  lines(den$x, den$y, col = col_mRNA[i], lwd = 2)
+}
+#legend("topright", legend = samples$samplename, text.col = col, bty = "n")
+#dev.off()
+lcpm <- cpm(DGElist_mRNA_38, log=TRUE)
+plot(density(lcpm[,1]), col = col_mRNA[1], lwd = 2, ylim = c(0, 0.20), las = 2,
+     main = "", xlab = "")
+title(main = "B. DGElist_mRNA_38 Filtered data", xlab = "Log-cpm")
+abline(v = 1, lty = 3)
+for (i in 1:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col = col_mRNA[i], lwd = 2)
+}
+
+
+```
+
+# TMM normalisation of libraries
+
+Before differential expression analysis the sample libraries need to be normalised to account for differences in initial library size.     
+Normalising the libraries allows for the direct comparison between samples.   
+Here the Trimmed Mean of M Values method is used.   
+
+```{r TMM}
+
+# method = c("TMM","TMMwsp","RLE","upperquartile","none")
+
+# Plot the distribution of (low count filtered) counts prior to normalisation 
+nsamples <- ncol(DGElist_mRNA_38)
+# set up colours for the density plots
+col_mRNA <- colorRampPalette(brewer.pal(11,"Spectral"))(ncol(DGElist_mRNA_38))
+lcpm <- cpm(DGElist_mRNA_38, log = TRUE)
+boxplot(lcpm, las = 2,
+        col = col_mRNA,
+        main = "")
+title(main = "DGElist_mRNA_38: Un-normalised data ",
+      ylab = "Log-cpm") 
+
+# calculate normalisation factors and apply to the DGEList object
+DGElist_mRNA_38 <- calcNormFactors(DGElist_mRNA_38,
+                                   method = "TMM")
+# par(mfrow=c(1,1))
+# Distribution of normalised and filtered counts data
+boxplot(cpm(DGElist_mRNA_38, log = TRUE),
+        las = 2,
+        col = col_mRNA,
+        main = "")
+title(main = "DGElist_mRNA_38: Normalised data",
+      ylab = "Log-cpm")
+
+
+```
+
+## Plot MD
+
+This code chunk will plot an MD for each of the samples in a loop.
+
+```{r plot MD all samples}
+
+# for (i in 1:ncol(DGElist_mRNA_38)){
+#   
+#   plotMD(DGElist_mRNA_38[no_sex_chr,],
+#          column = i,
+#          main = paste(DGElist_mRNA_38$samples$samplename[i],
+#                       DGElist_mRNA_38$samples$Outcome[i],
+#                       sep = "_"))
+#   abline(h = 0,
+#          col = "red",
+#          lty = 2,
+#          lwd = 2)
+# }
+
+```
+
+
+# Plot MDS
+## mRNA - X chromosomes in
+
+```{r plot MDS all chromosomes}
+
+# calculate MDS data
+MDS <- plotMDS(edgeR::cpm(DGElist_mRNA_38,
+                          log = TRUE, prior.count = 5),
+               main = "MDS norm counts")
+# pull out x and y
+x <- MDS$x
+y <- MDS$y  
+# plot with ggplot
+plotData <- cbind(x, y) %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("name_flowCell") %>% 
+  full_join(., DGElist_mRNA_38$samples, by = "name_flowCell")
+plotData$GestationalAge <- as.numeric(plotData$GestationalAge)
+
+plotData %>% 
+  ggplot(aes(x = x,
+             y = y,
+             colour = Sex,
+             shape = Outcome)) +
+  geom_point(size = 6) +
+  geom_text_repel(aes(x = x,
+                y = y,
+                label = samplename,
+                colour = Sex),
+                max.overlaps = Inf,
+            show.legend = FALSE) +
+  labs(title = "MDS plot normalised counts - mRNA GRCh38 \nplacenta (sex Chr in)",
+       y = "DIM 2",
+       x = "DIM 1") +
+  theme_bw()
+
+```
+
+## Plot PCA of counts
+
+  - Here I'm looking to see how strong the biological signal is before starting the DE analysis
+
+```{r PCA}
+
+# perform pca using prcomp
+# nb: prcomp expects samples in rows and counts in columns
+pca <- stats::prcomp(t(edgeR::cpm(DGElist_mRNA_38,
+                    log = FALSE)),
+                    scale = TRUE)  # add the scale = true to account for expression size
+## plot pc1 and pc2
+# x contains the pc's
+plot(pca$x[,1], pca$x[,2])
+ 
+## make a scree plot
+# sdev^2 used to calculate how much variation each pc accounts for
+pca_var <- pca$sdev^2
+# calculate sdev^2 as a percentage of total variation
+pca.var.per <- as.data.frame(round(pca_var/sum(pca_var)*100, 1)) %>%
+  set_colnames(., "PC_Percent") %>%
+  mutate(., PC = as.factor(paste("PC-", 1:length(pca_var), sep=""))) %>%
+  mutate(cum_pc = cumsum(PC_Percent))
+lvls <- levels(pca.var.per$PC)
+vline.level <- dplyr::filter(pca.var.per, cum_pc > 80)[1,]
+# Scree plot 
+ggplot(data = pca.var.per) +
+  geom_point(aes(x = reorder(PC, -PC_Percent), 
+                 y = PC_Percent)) +
+  ggtitle("Placenta PCA Scree plot") +
+  theme_bw(base_size = 16) +
+  labs(x = "Principal Component") +
+  theme(axis.text.x = element_text(angle = 270, hjust = 1)) + 
+  geom_vline(xintercept = vline.level$PC, col='red', lwd=1) +
+  annotate("text", x = 10, y = 25, label = "<- 80% ->", colour = "red")
+# ggsave(here("Figures/PCA/screePlot_84.jpg"),
+#        width = 27, height = 21, units  = "cm")
+# extract PC1&2 and plot - colour = sequencing batch
+data.frame(name_flowCell = rownames(pca$x),
+  X = pca$x[,1],
+  Y = pca$x[,2]) %>%
+  left_join(., DGElist_mRNA_38$samples, by = "name_flowCell") %>%
+  dplyr::select(., name_flowCell, X, Y, Outcome, Sex, flowCell) %>%
+ggplot(aes(x = X, 
+           y = Y, 
+           label = name_flowCell,
+           shape = Outcome,
+           colour = Sex),
+           size = 6) +
+  geom_text_repel(family = "Times New Roman",
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  geom_point(size = 6) + 
+  xlab(paste("PC1 - ", pca.var.per[1,1], "%", sep="")) +
+  ylab(paste("PC2 - ", pca.var.per[2,1], "%", sep="")) +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(colour="black"))
+
+
+```
+
+## Pairs plots - PC1:10
+
+```{r pairs plots pca}
+
+pairsData <- data.frame(pca$x[,1:10]) %>%
+  tibble::rownames_to_column("name_flowCell") %>% 
+  dplyr::left_join(., dplyr::select(DGElist_mRNA_38$samples, name_flowCell, Sex, Outcome, cohort, lib.size, flowCell),
+                   by = "name_flowCell")
+pairsData$cohort <- as.factor(pairsData$cohort)
+pairsData$Sex <- as.factor(pairsData$Sex)
+pairsData$Outcome <- as.factor(pairsData$Outcome)
+
+# create the pairs plots
+my_cols <- c("red", "grey")  
+pairs(pairsData[, 2:11],
+      pch = 19,
+      cex = 0.5,
+      col = my_cols[pairsData$Outcome],
+      lower.panel = NULL)
+
+pairs(pairsData[, c(2:5, 15)],
+      pch = 5,
+      cex = 0.5,
+      col = my_cols[pairsData$Outcome],
+      lower.panel = NULL)
+
+GGally::ggpairs(pairsData,
+                columns = c(2:11),
+                ggplot2::aes(colour = Outcome))
+
+```
+
+# Row centered counts with PCA
+
+```{r row centrered counts}
+
+# row center the batch corrected counts
+# do this by subtracting the row(gene) mean from each count
+
+# center with 'scale()'
+# setting `scale = FALSE` subtracts the mean rather than zero centering
+center_scale <- function(x) {
+    scale(x, scale = FALSE)
+}
+
+# apply it
+row_centered_counts <- center_scale(t(DGElist_mRNA_38$counts)) %>% 
+  t()
+
+# perform pca using prcomp
+# nb: prcomp expects samples in rows and counts in columns
+pca_row_cent <- stats::prcomp(t(row_centered_counts), scale = TRUE)  # add the scale = true to account for expression size
+## plot pc1 and pc2
+# x contains the pc's
+plot(pca_row_cent$x[,1], pca_row_cent$x[,2])
+ 
+## make a scree plot
+# sdev^2 used to calculate how much variation each pc accounts for
+pca_var_row_cent <- pca_row_cent$sdev^2
+# calculate sdev^2 as a percentage of total variation
+pca.var.per_row_cent <- as.data.frame(round(pca_var_row_cent/sum(pca_var_row_cent)*100, 1)) %>%
+  set_colnames(., "PC_Percent") %>%
+  mutate(., PC = as.factor(paste("PC-", 1:length(pca_var_row_cent), sep=""))) %>%
+  mutate(cum_pc = cumsum(PC_Percent))
+lvls <- levels(pca.var.per_row_cent$PC)
+vline.level <- dplyr::filter(pca.var.per_row_cent, cum_pc > 80)[1,]
+# Scree plot 
+ggplot(data = pca.var.per_row_cent) +
+  geom_point(aes(x = reorder(PC, -PC_Percent), 
+                 y = PC_Percent)) +
+  ggtitle("Placenta PCA Scree plot") +
+  theme_bw(base_size = 16) +
+  labs(x = "Principal Component") +
+  theme(axis.text.x = element_text(angle = 270, hjust = 1)) + 
+  geom_vline(xintercept = vline.level$PC, col='red', lwd=1) +
+  annotate("text", x = 10, y = 25, label = "<- 80% ->", colour = "red")
+# ggsave(here("Figures/PCA/screePlot_84.jpg"),
+#        width = 27, height = 21, units  = "cm")
+# extract PC1&2 and plot - colour = sequencing batch
+plotData <- data.frame(name_flowCell = rownames(pca_row_cent$x),
+  X = pca_row_cent$x[,1],
+  Y = pca_row_cent$x[,2]) %>%
+  left_join(., DGElist_mRNA_38$samples, by = "name_flowCell") %>%
+  dplyr::select(., name_flowCell, X, Y, Outcome, Sex, maternalAge, BMI, Ethnicity, Birthweight, deliveryMode, lib.size)
+
+ggplot(data = plotData,
+       aes(x = X, 
+           y = Y, 
+           label = name_flowCell,
+           shape = Outcome,
+           colour = lib.size),
+           size = 6) +
+    geom_point(size = 6) + 
+  geom_text_repel(data = plotData,
+                  aes(label=name_flowCell),
+                  show.legend = FALSE,
+                  family = "Times New Roman",
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  xlab(paste("PC1 - ", pca.var.per_row_cent[1,1], "%", sep="")) +
+  ylab(paste("PC2 - ", pca.var.per_row_cent[2,1], "%", sep="")) +
+  theme_bw(base_size = 14) +
+  theme(axis.text.x = element_text(colour="black"))
+
+```
+
+## Sanity plots of known placenta housekeeping genes
+
+```{r housekeeping genes}
+
+library(viridis)
+library(hrbrthemes)
+
+housekeeping <- data.frame(ensbl = c("ENSG00000112592", "ENSG00000073578", "ENSG00000164924", 
+                                     "ENSG00000165704", "ENSG00000256269", "ENSG00000111640",
+                                     "ENSG00000075624", "ENSG00000179091", "ENSG00000198900"), 
+                           gene = c("TBP", "SDHA", "YWHAZ", "HPRT1", "HMBS", "GAPDH", 
+                                    "actinB", "CYC1", "TOP1"))
+
+
+
+data <- edgeR::cpm(DGElist_mRNA_38, log = TRUE) %>% 
+               subset(., rownames(.) %in% housekeeping$ensbl) %>%
+  t() %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("name_flowCell") %>% 
+  dplyr::left_join(., DGElist_mRNA_38$samples[, c("name_flowCell","Outcome")]) %>%
+  dplyr::mutate(., newname = paste(name_flowCell, Outcome, sep = "_")) %>% 
+  dplyr::select(., -name_flowCell, -Outcome) %>% 
+  tibble::column_to_rownames("newname") %>% 
+  t()
+
+# Heatmap 
+ggplot(data = melt(data),
+       aes(x = Var2,
+           y = Var1,
+           fill = value)) +
+  geom_tile() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 270)) +
+  theme(axis.title.x = element_text(colour="black")) +
+  theme(axis.text.y=element_text(colour="black")) +
+  ylab(paste("Housekeeping gene", "TMM normalised counts", sep = " ")) +
+  xlab("Samplename") +
+  labs(fill = "log2 cpm") +
+  viridis::scale_fill_viridis(discrete=FALSE)
+
+## column annotations
+
+flowCell <- c(unique(DGElist_mRNA_38$samples$flowCell))
+sd_25 <- c("STP0596", "STP0148", "SCP4157")
+
+OutcomeOrder <- DGElist_mRNA_38$samples %>% 
+  arrange(., desc(group))
+rownames(OutcomeOrder) <- paste(rownames(OutcomeOrder), OutcomeOrder$Outcome, sep = "_")
+
+col_anno <- data.frame(DGElist_mRNA_38$samples) %>% 
+  dplyr::select(., Outcome, Sex, cohort, SmokingStatus)
+rownames(col_anno) <- paste(rownames(col_anno), col_anno$Outcome, sep = "_")
+
+pheatmap(data[housekeeping$ensbl, rownames(OutcomeOrder)],
+         annotation_col = col_anno,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         treeheight_row = 0,
+         treeheight_col = 15,
+         show_rownames = TRUE,
+         scale = "row")
+
+
+
+```
+
+## Sanity plots of known PE genes
+
+```{r PE genes}
+
+# Gene of Interest (GOI)
+GOI_PE_UP <- data.frame(ensbl=c("ENSG00000178726", "ENSG00000115602",
+                             "ENSG00000174697", "ENSG00000070404",
+                             "ENSG00000169495", "ENSG00000136002",
+                             "ENSG00000012223", "ENSG00000142623",
+                             "ENSG00000224658", "ENSG00000102755",
+                             "ENSG00000118849", "ENSG00000165810",
+                             "ENSG00000211448", "ENSG00000243836",
+                             "ENSG00000150722", "ENSG00000181458",
+                             "ENSG00000159399"),
+                  gene=c("THBD", "IL1RL1", "LEP", "FSTL3",
+                         "HTRA4", "ARHGEF4", "LTF", "PADI1",
+                         "RP11-631F7.1", "FLT1", "RARRES1",
+                         "BTNL9", "DIO2", "WDR86-AS1", "PPP1R1C",
+                         "TMEM45A", "HK2"),
+                  direction = "up")
+
+GOI_PE_DOWN <- data.frame(ensbl=c("ENSG00000233913", "ENSG00000134548",
+                                  "ENSG00000203859", "ENSG00000213088",
+                                  "ENSG00000114473", "ENSG00000260719",
+                                  "ENSG00000091137", "ENSG00000157064"),
+                  gene=c("RPL10P9", "SPX", "HSD3B2", "ACKR1",
+                         "IQCG", "AC009133.17", "SLC26A4", "NMNAT2"),
+                  direction = "down")
+
+GOI_UP_DOWN <- rbind(GOI_PE_UP, GOI_PE_DOWN)
+
+samples <- DGElist_mRNA_38$samples
+
+counts <- edgeR::cpm(DGElist_mRNA_38, log = TRUE)
+
+pd <- position_dodge(width = 0.5)
+
+lcpm <- edgeR::cpm(DGElist_mRNA_38, log = TRUE)
+
+## Print all of the plots at once
+for (i in 1:nrow(GOI_PE_UP)) {
+melt_lcpm <- melt(subset(lcpm, rownames(lcpm) %in% GOI_PE_UP$ensbl[i])) %>% 
+  as.data.frame() %>% 
+  set_colnames(c("ensbl", "name_flowCell", "log2cpm")) %>% 
+  # tibble::rownames_to_column("samplename") %>% 
+  left_join(., DGElist_mRNA_38$samples[, c("name_flowCell", "Outcome", "Sex")], by = "name_flowCell") 
+  
+beeswarm <- ggplot(melt_lcpm, aes(x = Sex,
+                                y = log2cpm,
+                                fill = Outcome)) +
+  stat_boxplot(geom="errorbar",
+               position = pd,
+               width = 0.2) +
+  geom_boxplot(width = 0.5,
+               position = pd) +
+  #     geom_boxplot(aes(x = Fetal.Sex,
+  #                  y =  log2cpm,
+  #                  fill = simpleOutcome)) +
+  stat_summary(fun = mean,
+               geom = "point",
+               size=2,
+               shape = 5,
+               position = position_dodge(0.5)) +
+  geom_beeswarm(dodge.width = 0.6, cex = 2) +
+  theme_bw(base_size = 18) +
+  ylab(paste("log2 CPM Counts", GOI_PE_UP$ensbl[i], GOI_PE_UP$gene[i], sep = " - ")) +
+  theme(axis.text.x = element_text(colour = "black")) +
+  theme(legend.position = "bottom")
+print(beeswarm)
+}
+
+# make table for column annotations
+PE_anno <- data.frame(DGElist_mRNA_38$samples) %>% 
+  dplyr::select(., Outcome, Sex, cohort, SmokingStatus, flowCell)
+
+# make table for the row annotations
+rownames <- rownames(subset(lcpm, rownames(lcpm) %in% GOI_UP_DOWN$ensbl)[, OutcomeOrder$name_flowCell])
+row_anno <- data.frame(subset(GOI_UP_DOWN, ensbl %in% rownames)) %>% 
+  dplyr::select(., -gene) %>%
+  as_tibble() %>% 
+  tibble::column_to_rownames("ensbl")
+# plot the heatmap
+pheatmap(subset(row_centered_counts, rownames(row_centered_counts) %in% GOI_UP_DOWN$ensbl)[rownames(row_anno), OutcomeOrder$name_flowCell],
+         annotation_col = col_anno,
+         annotation_row = row_anno,
+         cutree_cols = 2,
+         cutree_rows = 2,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         scale = "row")
+
+```
+
+## BCV - edgeR mode
+## sex chromosomes are in
+
+```{r bcv}
+
+# calculate and plot BCV for all samples together
+y <- DGElist_mRNA_38
+y <- estimateCommonDisp(y)
+y <- estimateTrendedDisp(y)
+y <- estimateTagwiseDisp(y)
+plotBCV(y)
+
+# vector of only male sample names
+males <- dplyr::filter(DGElist_mRNA_38$samples, Sex == "M")[, "name_flowCell"]
+# subset DGEList to contain only males
+y_male <- DGElist_mRNA_38[, males]
+# calculate and plot BCV for male samples only
+y_male <- estimateCommonDisp(y_male)
+y_male <- estimateTrendedDisp(y_male)
+y_male <- estimateTagwiseDisp(y_male)
+plotBCV(y_male,
+        xlab = "Average log CPM",
+        ylab = "Biological coefficient of variation - male",
+        pch = 16,
+        cex = 0.2,
+        col.common = "red",
+        col.trend = "blue",
+        col.tagwise = "black")
+
+# vector of only female sample names
+females <- dplyr::filter(DGElist_mRNA_38$samples, Sex == "F")[, "name_flowCell"]
+# subset DGEList to contain only females
+y_female <- DGElist_mRNA_38[, females]
+# calculate and plot BCV for female samples only
+y_female <- estimateCommonDisp(y_female)
+y_female <- estimateTrendedDisp(y_female)
+y_female <- estimateTagwiseDisp(y_female)
+plotBCV(y_female,
+        xlab = "Average log CPM",
+        ylab = "Biological coefficient of variation - female",
+        pch = 16,
+        cex = 0.2,
+        col.common = "red",
+        col.trend = "blue",
+        col.tagwise = "black")
+
+```
+
+## mRNA sex specific differential expression - PE
+- covariates
+  - maternal age
+  - maternal BMI
+  
+```{r sex specific DE pathology}
+
+# add a sex_pathology column to the metadata
+DGElist_mRNA_38$samples <- mutate(DGElist_mRNA_38$samples,
+                                  sex_pathology = paste(Sex, Outcome, sep = "_"))
+
+# set the new factor levels
+DGElist_mRNA_38$samples$sex_pathology <- factor(DGElist_mRNA_38$samples$sex_pathology, c("F_Control", "M_Control", "F_PE", "M_PE"))
+
+tempDE <- DGElist_mRNA_38
+
+# establish the design matrix
+design_mRNA_sex_PE <- model.matrix(~0 + sex_pathology + maternalAge + BMI,
+                       data = tempDE$samples)
+# make the column names a little nicer
+colnames(design_mRNA_sex_PE) <- c("F_Control", "M_Control", "F_PE", "M_PE", "maternalAge", "BMI")
+
+# perform the voom quality weights
+voom_mRNA_sex_PE <- voom(tempDE, design_mRNA_sex_PE, plot = TRUE)
+# fit the linear model
+fit_mRNA_sex_PE <- lmFit(voom_mRNA_sex_PE, design_mRNA_sex_PE)
+# use eBayes to share information across genes
+# fit_mRNA_sex_PE <- eBayes(fit_mRNA_sex_PE)
+# check the decide test
+summary(decideTests(fit_mRNA_sex_PE)) # before FDR correction
+
+# set the contrasts - this makes it easier to "see" what we're testing
+contrast_mRNA_sex_PE <- makeContrasts(female_PE = F_PE-F_Control,
+                                      male_PE = M_PE-M_Control,
+                                      levels = design_mRNA_sex_PE)
+
+# fit a linear regression to the contrast questions
+fit_mRNA_sex_PE <- contrasts.fit(fit_mRNA_sex_PE, contrast_mRNA_sex_PE)
+
+# perform bayesian adjustment
+fit_mRNA_sex_PE <- eBayes(fit_mRNA_sex_PE)
+
+# summary table of the sex PE fit
+summary(decideTests(fit_mRNA_sex_PE,
+                    adjust.method = "fdr",
+                    p.value = 0.05))
+
+# all DE results for the female_PE comparison
+allTable_female_PE <- topTable(fit_mRNA_sex_PE,
+                             coef = 1,
+                             n = Inf,
+                             sort = "p")
+
+saveRDS(allTable_female_PE,
+        file = "differentialExpressionFiles/allTable_female_PE.Rds")
+
+writexl::write_xlsx(as.data.frame(allTable_female_PE), "differentialExpressionFiles/allTable_female_PE.xls")
+
+# only significant (after fdr correction) DE results for the female_PE comparison
+topTable_female_PE <- topTable(fit_mRNA_sex_PE,
+                             coef = 1,
+                             n = Inf,
+                             sort = "p",
+                             p = 0.05,
+                             adjust.method = "fdr") # requires eBayes.
+
+# all DE results for the female_PE comparison
+allTable_male_PE <- topTable(fit_mRNA_sex_PE,
+                             coef = 2,
+                             n = Inf,
+                             sort = "p")
+
+saveRDS(allTable_male_PE,
+        file = "differentialExpressionFiles/allTable_male_PE.Rds")
+
+writexl::write_xlsx(as.data.frame(allTable_male_PE), "differentialExpressionFiles/allTable_male_PE.xls")
+
+# only significant (after fdr correction) DE results for the female_PE comparison
+topTable_male_PE <- topTable(fit_mRNA_sex_PE,
+                             coef = 2,
+                             n = Inf,
+                             sort = "p",
+                             p = 0.05,
+                             adjust.method = "fdr") # requires eBayes.
+
+```
+
+## Volcano plot for visualisation of differential expression
+### male
+
+```{r volcano plots}
+
+decide <- decideTests(fit_mRNA_sex_PE)
+d2 <- topTable(fit_mRNA_sex_PE, coef = 2, n = Inf, sort = "p") #[,c(2,6)]
+d2$threshold <- 0
+d2$threshold[0:nrow(topTable_male_PE)] <- 1
+d2$threshold <- as.factor(d2$threshold)
+d3 <- decideTests(fit_mRNA_sex_PE) %>%
+  as.data.frame()
+d3 <- d3[2]
+d4 <- left_join(tibble::rownames_to_column(d2), (tibble::rownames_to_column(d3)),
+                       by = "rowname")
+d4$male_PE <- as.factor(d4$male_PE)
+d4$neg.log10FDR <- -log10(d4$adj.P.Val)
+# set colours for the volcano plot
+colour <- c("red", "black", "darkgreen")
+FDR_FC_Decide <- decideTests(fit_mRNA_sex_PE, lfc = 0)[,"male_PE"] %>%
+  as.data.frame() %>%
+  set_colnames("FDR_FC_Decide") %>%
+  tibble::rownames_to_column() %>%
+  left_join(., d4, by = "rowname")
+FDR_FC_Decide$FDR_FC_Decide <- as.factor(FDR_FC_Decide$FDR_FC_Decide)
+
+volcano_male <- ggplot(data = FDR_FC_Decide,
+                  aes(x = logFC,
+                      y = neg.log10FDR,
+                      label = rowname,
+                      colour = FDR_FC_Decide)) +
+  geom_point(alpha=0.9, size=2.00) +
+  xlab(expression(Log[2]*" Fold Change")) + ylab(expression("-ve "*Log[10]*" FDR")) +
+  scale_color_manual(values = colour, name="mRNA\nRegulation",
+                         breaks = c("-1", "0", "1"),
+                         labels = c("Down-regulated", "Not Significant", "Up-regulated")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_hline(yintercept = -log10(.05), linetype = "dotted") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dotted") +
+  theme_bw() +
+  theme(text = element_text(size=18)) +
+  theme(axis.text.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.text.y = element_text(colour = "black",
+                                   face = "bold")) +
+  theme(axis.title.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.title.y = element_text(colour = "black",
+                                   face = "bold")) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide==1),
+                  aes(label = gene_name),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide==-1),
+                  aes(label = gene_name),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE) +
+  theme(legend.position="bottom")
+
+volcano_male
+
+
+
+```
+
+### Female
+
+```{r volcano plots}
+
+decide_fem <- decideTests(fit_mRNA_sex_PE)
+d2_fem <- topTable(fit_mRNA_sex_PE, coef = 1, n = Inf, sort = "p") #[,c(2,6)]
+d2_fem$threshold <- 0
+d2_fem$threshold[0:nrow(topTable_female_PE)] <- 1
+d2_fem$threshold <- as.factor(d2_fem$threshold)
+d3_fem <- decideTests(fit_mRNA_sex_PE) %>%
+  as.data.frame()
+d3_fem <- d3_fem[1]
+d4_fem <- left_join(tibble::rownames_to_column(d2_fem), (tibble::rownames_to_column(d3_fem)),
+                       by = "rowname")
+d4_fem$female_PE <- as.factor(d4_fem$female_PE)
+d4_fem$neg.log10FDR <- -log10(d4_fem$adj.P.Val)
+# set colours for the volcano plot
+colour <- c("red", "black", "darkgreen")
+FDR_FC_Decide_fem <- decideTests(fit_mRNA_sex_PE, lfc = 0)[,"female_PE"] %>%
+  as.data.frame() %>%
+  set_colnames("FDR_FC_Decide") %>%
+  tibble::rownames_to_column() %>%
+  left_join(., d4_fem, by = "rowname") %>%
+  as.data.frame()
+FDR_FC_Decide_fem$FDR_FC_Decide <- as.factor(FDR_FC_Decide_fem$FDR_FC_Decide)
+
+
+volcano_female <- ggplot(data = allTable_female_PE,
+            aes(x = logFC, y = P.Value)) + 
+  geom_point(alpha=0.9,
+             size=2.00) +
+  xlab(expression(Log[2]*" Fold Change")) +
+  ylab("P-Value") +
+  theme(text = element_text(size=18)) +
+  theme(axis.text.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.text.y = element_text(colour = "black",
+                                   face = "bold")) +
+  theme(axis.title.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.title.y = element_text(colour = "black",
+                                   face = "bold"))
+
+        
+volcano_female_reverse <- volcano_female + scale_y_reverse()
+
+ggarrange(volcano_male, volcano_female_reverse,
+labels = c("a", "b"),
+font.label = list(size = 16, face = "bold", color ="black"),
+ncol = 2, nrow = 1,
+common.legend = TRUE,
+legend = "bottom")
+
+```
+
+## mRNA sex specific differential expression - PE
+- covariates
+  - Cohort
+
+```{r sex specific DE pathology}
+
+# ensure cohort is a factor
+DGElist_mRNA_38$samples$cohort <- factor(DGElist_mRNA_38$samples$cohort, c("SCOPE", "STOP"))
+
+design_mRNA_sex_PE_cohort <- model.matrix(~0 + sex_pathology + cohort,
+                                          data = DGElist_mRNA_38$samples)
+
+colnames(design_mRNA_sex_PE_cohort) <- c("F_Uncomplicated", "M_Uncomplicated", "F_PE", "M_PE", "Cohort_STP")
+
+voom_mRNA_sex_PE_cohort <- voom(DGElist_mRNA_38, design_mRNA_sex_PE_cohort, plot=TRUE)
+
+fit_mRNA_sex_PE_cohort <- lmFit(voom_mRNA_sex_PE_cohort, design_mRNA_sex_PE_cohort)
+
+fit_mRNA_sex_PE_cohort <- eBayes(fit_mRNA_sex_PE_cohort)
+
+summary(decideTests(fit_mRNA_sex_PE_cohort)) # before FDR correction
+
+contrast_mRNA_sex_PE_cohort <- makeContrasts(female_PE = F_PE-F_Uncomplicated,
+                                      male_PE = M_PE-M_Uncomplicated,
+                                      levels = design_mRNA_sex_PE_cohort)
+
+# fit a linear regression to the contrast questions
+fit_mRNA_sex_PE_cohort <- contrasts.fit(fit_mRNA_sex_PE_cohort, contrast_mRNA_sex_PE_cohort)
+
+# perform bayesian adjustment
+fit_mRNA_sex_PE_cohort <- eBayes(fit_mRNA_sex_PE_cohort)
+
+# summary table of the sexMode fit
+summary_fit_sex_PE_cohort <- summary(decideTests(fit_mRNA_sex_PE_cohort,
+                                           adjust.method = "fdr",
+                                           p.value = 0.05))
+
+# all DE results for the female_PE comparison
+allTable_female_PE_cohort <- topTable(fit_mRNA_sex_PE_cohort,
+                             coef = 1,
+                             n = Inf,
+                             sort = "p")
+
+# only significant (after fdr correction) DE results for the female_PE comparison
+topTable_female_PE_cohort <- topTable(fit_mRNA_sex_PE_cohort,
+                             coef = 1,
+                             n = Inf,
+                             sort = "p",
+                             p = 0.05,
+                             adjust.method = "fdr") # requires eBayes.
+
+# all DE results for the male_PE comparison
+allTable_male_PE_cohort <- topTable(fit_mRNA_sex_PE_cohort,
+                             coef = 2,
+                             n = Inf,
+                             sort = "p")
+
+# only significant (after fdr correction) DE results for the male_PE comparison
+topTable_male_PE_cohort <- topTable(fit_mRNA_sex_PE_cohort,
+                             coef = 2,
+                             n = Inf,
+                             sort = "p",
+                             p = 0.05,
+                             adjust.method = "fdr") # requires eBayes.
+
+
+```
+
+## Volcano plot for visualisation of differential expression
+
+```{r volcano plots}
+
+decide <- decideTests(fit_mRNA_sex_PE_cohort)
+d2 <- topTable(fit_mRNA_sex_PE_cohort, coef = 2, n = Inf, sort = "p") #[,c(2,6)]
+d2$threshold <- 0
+d2$threshold[0:nrow(topTable_male_PE_cohort)] <- 1
+d2$threshold <- as.factor(d2$threshold)
+d3 <- decideTests(fit_mRNA_sex_PE_cohort) %>%
+  as.data.frame()
+d3 <- d3[2]
+d4 <- left_join((tibble::rownames_to_column(d2)),
+                       (tibble::rownames_to_column(d3)),
+                       by = "rowname")
+d4$male_PE <- as.factor(d4$male_PE)
+d4$neg.log10FDR <- -log10(d4$adj.P.Val)
+
+# set colours for the volcano plot
+colour <- c("red", "black", "darkgreen")
+FDR_FC_Decide <- decideTests(fit_mRNA_sex_PE_cohort, lfc = 0)[,"male_PE"] %>%
+  as.data.frame() %>%
+  set_colnames("FDR_FC_Decide") %>%
+  tibble::rownames_to_column() %>%
+  left_join(., d4, by = "rowname") %>% 
+  dplyr::select(., gene_id = rowname, everything())
+FDR_FC_Decide$FDR_FC_Decide <- as.factor(FDR_FC_Decide$FDR_FC_Decide)
+
+volcano <- ggplot(data = FDR_FC_Decide,
+                                  aes(x = logFC,
+                                      y = -log(adj.P.Val, 10),
+                                      label = gene_name,
+                                      colour = FDR_FC_Decide)) +
+  geom_point(alpha=0.9, size=2.00) +
+  xlab(expression(Log[2]*" Fold Change")) + ylab(expression("-ve "*Log[10]*" FDR")) +
+  scale_color_manual(values = colour, name="mRNA\nRegulation",
+                         breaks = c("-1", "0", "1"),
+                         labels = c("Down-regulated", "Not Significant", "Up-regulated")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_hline(yintercept = -log10(.05), linetype = "dotted") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dotted") +
+  theme_bw() +
+  theme(text = element_text(size=14)) +
+  theme(axis.text.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.text.y = element_text(colour = "black",
+                                   face = "bold")) +
+  theme(axis.title.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.title.y = element_text(colour = "black",
+                                   face = "bold")) +
+  geom_text_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == 1),
+                  aes(label = gene_name),
+                  show.legend = FALSE,
+                  box.padding = 0.5, max.overlaps = Inf) +
+  geom_text_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == -1), 
+                  aes(label = gene_name),
+                  show.legend = FALSE,
+                  box.padding = 0.5,
+                  max.overlaps = Inf)
+volcano
+
+# MA plot in ggplot
+# MAplot_data_pregnancy_noHaemo <- full_join(FDR_FC_Decide_pregnant_noHaemo, allTable_pregnancy_noHaemo, by = c(“rowname” = “SYMBOL”))
+MAplot <- ggplot(data = FDR_FC_Decide,
+                                  aes(x = AveExpr,
+                                      y = logFC,
+                                      label = gene_name,
+                                      colour = FDR_FC_Decide)) +
+  geom_point(alpha = 0.9, size = 2.00) +
+  xlab(expression("Average "*Log[2]*" Expression")) + ylab(expression(Log[2]*" Fold Change")) +
+  scale_color_manual(values = colour, name = "mRNA\nRegulation\n(PE)",
+                         breaks = c("-1", "0", "1"),
+                         labels = c("Down-regulated", "No Change", "Up-regulated")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted") +
+  geom_vline(xintercept = 10, linetype = "dotted") +
+  theme_bw() +
+  theme(text = element_text(size=14)) +
+  theme(axis.text.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.text.y = element_text(colour = "black",
+                                   face = "bold")) +
+  theme(axis.title.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.title.y = element_text(colour = "black",
+                                   face = "bold")) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == 1 & logFC >= 1),
+                  aes(label = gene_name),
+                  fill = "white",
+                  show.legend = FALSE,
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == -1 & logFC <= -1),
+                  aes(label = gene_name),
+                  fill = "white",
+                  show.legend = FALSE,
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == 1 & AveExpr > 10),
+                  aes(label = gene_name),
+                  fill = "white",
+                  show.legend = FALSE,
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  geom_label_repel(data = dplyr::filter(FDR_FC_Decide, FDR_FC_Decide == -1 & AveExpr > 10),
+                  aes(label = gene_name),
+                  fill = "white",
+                  show.legend = FALSE,
+                  box.padding = 0.5,
+                  max.overlaps = Inf)
+MAplot
+```
+
+# Sex Independent Differential Expression Analysis - Preeclampsia
+  * Option 1: Factorial formula and no contrast
+A nested factorial model allows you to compare groups within each sex. This achieves the aim of treating the two sexes separately.
+The `model.matrix` here fits sex (M, F), outcome (PE, control), maternal age (continuous), maternal BMI (continuous) and the sex x outcome interaction.
+I will use the output from the interaction to investigate the male and female comparisons independently by asking the question, "For each gene is there a non-zero mean difference in the PE and control the male group, or the female group.". This may not be the best way to ask this question given that there is a different PE risk for both younger and older women compared to women aged between these two groups. [Sibai et al. 2005](https://www.sciencedirect.com/science/article/pii/S0140673605179872?casa_token=z5kbmg1Zl1wAAAAA:hZcSmhrMTGPAIOvQgPTtHPVEiizNMFUduVbQXYXqCOzkIbqJoTkl69cS1ft91KHFqhPayvK83432)
+Here we fit a linear model to PE and Age, but given that the risk is bimodal there must be a better way to do this?
+
+```{r differential expression using global t-test p value}
+
+# temp <- DGElist_mRNA_38
+# ensure sex is a factor
+DGElist_mRNA_38$samples$Sex <- factor(DGElist_mRNA_38$samples$Sex, c("F", "M"))
+
+# design to test DE between PE looking at female and male baring pregnancies seperately
+design_independent_sex_PE <- model.matrix(~0 + Sex + Outcome + maternalAge + BMI + Sex:Outcome,
+                                               data = DGElist_mRNA_38$samples)
+# make the column names a bit easier to read
+colnames(design_independent_sex_PE) <- c("Male", "Female", "PE", "maternalAge", "BMI", "male_PE")
+
+# perform the voom transform
+voom_independent_sex_PE <- voom(DGElist_mRNA_38, design_independent_sex_PE, plot=TRUE)
+
+fit_independent_sex_PE <- lmFit(voom_independent_sex_PE, 
+                                     design_independent_sex_PE)
+fit_independent_sex_PE <- eBayes(fit_independent_sex_PE)
+# defaults
+summary(decideTests(fit_independent_sex_PE))
+
+# messed with
+summary(decideTests(fit_independent_sex_PE,
+                    method = "global",
+                    adjust.method = "BH",
+                    p.value = 0.05))
+
+decide <- decideTests(fit_independent_sex_PE,
+                    method = "global",
+                    adjust.method = "BH",
+                    p.value = 0.05)
+
+write_fit <- function(fit,
+                      results = NULL, 
+                      F.adjust = "none",
+                      adjust = "fdr",
+                      method = "global", ...) {
+    if (!is(fit, "MArrayLM")) 
+        stop("fit should be an MArrayLM object")
+    if (!is.null(results) && !is(results, "TestResults")) 
+        stop("results should be a TestResults object")
+    if (is.null(fit$t) || is.null(fit$p.value)) 
+        fit <- eBayes(fit)
+    method <- match.arg(method, c("separate", "global"))
+    p.value <- as.matrix(fit$p.value)
+    if (adjust == "none") {
+        p.value.adj <- NULL
+    }
+    else {
+        p.value.adj <- p.value
+        if (method == "separate") 
+            for (j in 1:ncol(p.value)) p.value.adj[, j] <- p.adjust(p.value[, j], method = adjust)
+        if (method == "global") 
+            p.value.adj[] <- p.adjust(p.value, method = adjust)
+    }
+    if (F.adjust == "none" || is.null(fit$F.p.value)) 
+        F.p.value.adj <- NULL
+    else F.p.value.adj <- p.adjust(fit$F.p.value, method = F.adjust)
+    tab <- list()
+    tab$A <- (fit$Amean)
+    tab$Coef <- (fit$coef)
+    tab$t <- (fit$t)
+    tab$p.value <- (p.value)
+    tab$p.value.adj <- (p.value.adj)
+    tab$F <- (fit$F)
+    tab$F.p.value <- (fit$F.p.value)
+    tab$F.p.value.adj <- F.p.value.adj
+    tab$Res <- unclass(results)
+    tab$Genes <- fit$genes
+    tab <- data.frame(tab, check.names = FALSE)
+    return(tab)
+}
+
+write_fit <- write_fit(fit = fit_independent_sex_PE,
+                       results = decide,
+                       method = "global",
+                       adjust = "fdr")
+
+write_fit_list <- list(
+  male_PE = write_fit %>% dplyr::select(contains("male_PE", ignore.case = FALSE),
+                                        starts_with("Genes")),
+  female_PE = write_fit %>% dplyr::select(contains("Female_PE", ignore.case = FALSE),
+                                          starts_with("Genes")),
+  maternalAge = write_fit %>% dplyr::select(contains("maternalAge"),
+                                            starts_with("Genes"))
+  )
+
+# set the alpha variable (significance)
+alpha <- 0.05
+
+write_fit_list %<>% lapply(function(x){
+  x %>% set_colnames(c("logFC", "t", "p.value", "p.value.adj", "direction", 
+                       "gene_name", "gene_biotype",
+                       "entrezid"))%>%
+    dplyr::mutate(sig=p.value.adj < alpha)%>%
+    dplyr::arrange(p.value.adj) %>%
+    dplyr::mutate(label = case_when(
+      sig == TRUE ~ gene_name,
+      sig == FALSE ~ ""
+    )) 
+})
+
+```
+
+## Volcano plots
+
+```{r volcano plot male comparison}
+
+# set colours for the volcano plot
+colour <- c("red", "darkgreen", "black")
+
+volcano <- ggplot(data = write_fit_list$female_PE,
+                                  aes(x = logFC,
+                                      y = -log10(p.value.adj),
+                                      label = rownames(write_fit_list$female_PE),
+                                      colour = as.factor(direction))) +
+  geom_point(alpha = 0.9, 
+             size = 2.00) +
+  xlab(expression(Log[2]*" Fold Change")) +
+  ylab(expression("-ve "*Log[10]*" FDR")) +
+  ggtitle("Female comparison") +
+  scale_color_manual(values = colour,
+                     name="mRNA\nRegulation",
+                     breaks = c("-1", "1", "0"),
+                     labels = c("Down-regulated", "Not Significant", "Up-regulated")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_hline(yintercept = -log10(.05), linetype = "dotted") +
+  # geom_vline(xintercept = c(-1, 1), linetype = "dotted") +
+  theme_bw() +
+  theme(text = element_text(size=14)) +
+  theme(axis.text.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.text.y = element_text(colour = "black",
+                                   face = "bold")) +
+  theme(axis.title.x = element_text(colour = "black",
+                                   face = "bold"),
+        axis.title.y = element_text(colour = "black",
+                                   face = "bold")) +
+  geom_label_repel(data = dplyr::filter(write_fit_list$female_PE, direction == 1 & logFC >= 1),
+                  aes(label = label),
+                  max.overlaps = Inf,
+                  fill = "white",
+                  show.legend = FALSE) +
+  geom_label_repel(data = dplyr::filter(write_fit_list$female_PE, direction == -1 & logFC <= -1),
+                  aes(label = label),
+                  max.overlaps = Inf,
+                  fill = "white",
+                  show.legend = FALSE)
+
+volcano
+
+# plot logFC density to check for approximate normality
+ggplot(data = write_fit_list$BMI) +
+  geom_density(aes(logFC))
+
+```
+
+## GSEA files
+
+Gene set enrichment analyses allow us to take a ranked set of genes and look for enrichment of the high and low ranked genes in curated gene sets.
+More on GSEA can be found [here](http://www.gsea-msigdb.org/gsea/index.jsp).
+The following code takes the DE table created in `r differential expression using global t-test p value` and uses the p-value to create a ranking metric used by GSEA to order the gene list.
+The gene ranking method here is taken from Kat's lab (John I think).
+
+```{r create GSEA input files}
+
+# make the male files
+# male_gsea <- write_fit_list$male_PE %>% 
+#   dplyr::filter(., gene_biotype == "protein_coding")
+# male_gsea <- male_gsea[ ! rownames(male_gsea) %in% removeDuplicates, ]
+# male_gsea$Rank <- (sign(male_gsea$logFC)) * (male_gsea$p.value.adj)
+# writexl::write_xlsx(as.data.frame(male_gsea) %>% 
+#   tibble::rownames_to_column("ensembl") %>% 
+#     dplyr::filter(., gene_biotype == "protein_coding") %>%
+#     dplyr::select(., gene_name = ensembl, Rank) %>%
+#     dplyr::arrange(desc(Rank)), "male_gsea.xlsx")
+
+male_gsea <- allTable_male_PE %>% 
+  dplyr::filter(., gene_biotype == "protein_coding")
+
+male_gsea["Rank_log"] <- (sign(male_gsea$logFC)) * (-log(male_gsea$adj.P.Val,10))
+# male_gsea["Rank_not_log"] <- (sign(male_gsea$logFC)) * -(male_gsea$adj.P.Val)
+# male_gsea["Rank_not_log_div_1"] <- (sign(male_gsea$logFC)) * -(1/male_gsea$adj.P.Val)
+
+# write the excel table to file
+writexl::write_xlsx(as.data.frame(male_gsea) %>%
+  tibble::rownames_to_column("ensembl") %>%
+    dplyr::filter(., gene_biotype == "protein_coding") %>%
+    dplyr::select(., gene_name = ensembl, Rank = Rank_log) %>%
+    dplyr::arrange(desc(Rank)), "male_rank_log.xlsx")
+
+
+
+
+
+# make the female files
+# female_gsea <- write_fit_list$female_PE
+# female_gsea$Rank <- (sign(female_gsea$logFC)) * (female_gsea$p.value.adj)
+# writexl::write_xlsx(as.data.frame(female_gsea) %>% 
+#   tibble::rownames_to_column("ensembl") %>% 
+#   dplyr::select(., gene_name = ensembl, Rank) %>% 
+#     dplyr::arrange(desc(Rank)), "male_gsea.xlsx")
+
+```
+
+## plot GOI
+
+```{r plot individual genes of interest}
+
+# new matrix of z-scores
+Z_log2CPM_counts <- base::scale(t(edgeR::cpm(DGElist_mRNA_38, log = TRUE)),
+                                scale = TRUE,
+                                center = TRUE) %>% 
+  t()
+
+GOI <- "ENSG00000145908"
+
+up_GOI <- c("ENSG00000047457", "ENSG00000145908", "ENSG00000134202", "ENSG00000101049", "ENSG00000163359", "ENSG00000225697", "ENSG00000163453", "ENSG00000249242", "ENSG00000165646", "ENSG00000134874", "ENSG00000072832", "ENSG00000169855", "ENSG00000164124", "ENSG00000026508", "ENSG00000186153", "ENSG00000116667", "ENSG00000113790", "ENSG00000134533", "ENSG00000106025", "ENSG00000149084", "ENSG00000151229")
+
+down_GOI <- c("ENSG00000196152", "ENSG00000137699", "ENSG00000151025", "ENSG00000151623")
+
+temp <- data.frame(Z_log2CPM_counts[GOI,]) %>% 
+  set_colnames(GOI) %>% 
+  tibble::rownames_to_column("name_flowCell") %>% 
+  left_join(., DGElist_mRNA_38$samples[, c("name_flowCell", "Outcome", "Sex")], by = "name_flowCell") %>% 
+  dplyr::mutate(., outcome_sex = paste(Outcome, Sex, sep = "_")) %>% 
+  dplyr::select(., -name_flowCell, -Outcome, -Sex)
+temp$outcome_sex <- factor(temp$outcome_sex, c("Control_M", "PE_M", "Control_F", "PE_F"))
+melt_temp <- melt(temp)
+
+ggplot(melt_temp, aes(x = outcome_sex,
+                y = value)) +
+  stat_boxplot(geom = "errorbar",
+               position = position_dodge(0.5),
+               width = 0.2) +
+  geom_boxplot(width = 0.5,
+               position = position_dodge(0.5)) +
+  stat_summary(fun = mean,
+               geom = "point",
+               size = 6,
+               shape = 5,
+               position = position_dodge(0.5)) +
+  ggbeeswarm::geom_beeswarm(groupOnX = TRUE,
+                dodge.width = 0.6,
+                cex = 1,
+                alpha = 0.4) +
+  theme_bw(base_size = 18)
+
+
+
+for(i in 1:length(down_GOI)) {
+  
+  temp <- data.frame(Z_log2CPM_counts[down_GOI[i],]) %>% 
+  set_colnames(GOI) %>% 
+  tibble::rownames_to_column("name_flowCell") %>% 
+  left_join(., DGElist_mRNA_38$samples[, c("name_flowCell", "Outcome", "Sex")], by = "name_flowCell") %>% 
+  dplyr::mutate(., outcome_sex = paste(Outcome, Sex, sep = "_")) %>% 
+  dplyr::select(., -name_flowCell, -Outcome, -Sex)
+temp$outcome_sex <- factor(temp$outcome_sex, c("Control_M", "PE_M", "Control_F", "PE_F"))
+melt_temp <- melt(temp)
+
+plot <- ggplot(melt_temp, aes(x = outcome_sex,
+                y = value)) +
+  stat_boxplot(geom = "errorbar",
+               position = position_dodge(0.5),
+               width = 0.2) +
+  geom_boxplot(width = 0.5,
+               position = position_dodge(0.5)) +
+  stat_summary(fun = mean,
+               geom = "point",
+               size = 6,
+               shape = 5,
+               position = position_dodge(0.5)) +
+  ggbeeswarm::geom_beeswarm(groupOnX = TRUE,
+                dodge.width = 0.6,
+                cex = 1,
+                alpha = 0.4) +
+  ylab(paste("Z-score (log2CPM counts)", down_GOI[i], sep = " ")) +
+  xlab("") +
+  theme_bw(base_size = 18)
+
+print(plot)
+  
+}
+
+```
+
+
+```{r session info}
+
+sessionInfo()
+
+```
