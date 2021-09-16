@@ -1,0 +1,1650 @@
+---
+title: "wgcna_preeclampsia_hg38"
+author: "Melanie Smith"
+date: "13/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE,
+    cache = FALSE,
+    fig.align = "center",
+    results = "hide"
+)
+```
+
+```{r Setup, include=TRUE, warning=FALSE, message=FALSE, results=FALSE}
+#Data manipulation
+library(tidyverse)
+library(reshape2)
+library(dynamicTreeCut)
+library(flashClust)
+library(magrittr)
+library(writexl)
+library(gtools)
+library(naturalsort)
+# Differential expression methods
+library(edgeR)
+library(DESeq2)
+library(limma)
+# R implementation of combat
+library(sva) 
+library(genefilter)
+# Enrichment
+library(clusterProfiler)
+library(topGO)
+library(DOSE)
+# Co-expression 
+library(WGCNA)
+library(anRichment)
+#Visualisation
+library(knitr)
+library(ggsci)
+library(ggrepel)
+library(corrplot)
+library(gridExtra)
+library(grid)
+library(pander)
+library(RColorBrewer)
+library(pheatmap)
+library(VennDiagram)
+# Annotations
+library(biomaRt)
+library(anRichment)
+library(org.Hs.eg.db)
+library(here)
+# Pathway enrichment
+library(enrichplot)
+library(msigdbr)
+
+
+#Options
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE,
+    cache = FALSE,
+    fig.align = "center",
+    results = "hide"
+)
+theme_set(theme_bw())
+
+## UDFs
+# function to negate magrittr::%in%
+`%notin%` <- Negate(`%in%`)
+
+# Function to save a pheatmap as a pdf in A4 size 
+save_pheatmap_pdf <- function(x, filename, width=2*8.27, height=2*11.69) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+```
+
+### Import Gene-level counts
+
+Import the raw counts `all.stranded.S2.count` and clean up the column names.
+Import the sample metadata and ensure the metadata and counts are in the same order.
+
+```{r}
+
+grch38_mRNA_placenta_counts <- read_delim(file = "rawData/Bulk_RNAseq_hg38/all.stranded.S2.count",
+                                          delim = "\t",
+                                          comment = "#")
+
+# tidy up the sample IDs
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\cancer\\/storage\\/alignments\\/CORE\\/placenta\\/hg38\\_STAR_bam\\/", "", colnames(grch38_mRNA_placenta_counts))
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\.Aligned\\.sortedByCoord\\.out\\.bam", "", colnames(grch38_mRNA_placenta_counts))
+colnames(grch38_mRNA_placenta_counts) <- gsub("\\/", "", colnames(grch38_mRNA_placenta_counts))
+
+# Preview
+grch38_mRNA_placenta_counts %>% head
+dim(grch38_mRNA_placenta_counts)
+
+# grab chromosome informtion for later
+chromosome <- grch38_mRNA_placenta_counts %>% 
+  dplyr::select(., Geneid, Chr) %>% 
+  transform(., test=do.call(rbind, strsplit(Chr, ';', fixed=TRUE)), stringsAsFactors=FALSE) %>% 
+  dplyr::select(., gene_id=Geneid, chromosome=test.1)
+
+# import metadata and rename the ADL columns that are actually SCOPE
+placenta_meta <- read_csv("cleanData/PlacentaGroup_Sample_information.csv") %>% 
+  dplyr::mutate(., name_flowCell = paste(samplename, flowCell, sep = "_")) %>% 
+  dplyr::arrange(., name_flowCell)
+
+# set factor levels for outcomes
+placenta_meta$Outcome <- factor(placenta_meta$Outcome, c("Control", "PE"))
+
+# vector of duplicated samples (repeat measures; text annotations on PCA plots if needed)
+duplicate <- data.frame(name_flowCell = c("SCP4913_C2BK8ACXX", "SCP4913_CDN0JANXX", "SCP4733_C2BK8ACXX", "SCP4733_CDN0JANXX", "SCP4538_C9FNFANXX", "SCP4538_CDN0JANXX", "SCP4536_C2BK8ACXX", "SCP4536_CDN0JANXX", "SCP4319_C2BK8ACXX", "SCP4319_CDN0JANXX", "SCP4157_C9WE0ANXX", "SCP4157_CDN0JANXX", "SCP3954_C2BK8ACXX", "SCP3954_CDN0JANXX", "SCP3929_C2BK8ACXX", "SCP3929_CDN0JANXX", "SCP3492_C9FNFANXX", "SCP3492_CDN0JANXX"))
+
+# Drop the columns we don't need anymore
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>% 
+  tibble::column_to_rownames("Geneid") %>% 
+  dplyr::select(., -Chr, -Start, -End, -Strand, -Length)
+
+# reorder the counts to match the metadata & drop samples (PAC and SRR) not in metadata sheet
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts[,placenta_meta$otherID]
+colnames(grch38_mRNA_placenta_counts) <- placenta_meta$name_flowCell
+
+```
+
+Before beginning the analysis, an ensembl database needs to be defined from `biomaRt` to use. `useMart` establishes the connection to the database of interest The functions below connect to a specified database and retrieves a dataset containing the # Gene level annotation information
+
+The methods to choose from here are Biomart and Annotation Hub.
+
+```{r eval=FALSE}
+
+# Retrieve gene annotation information from AnnotationHub
+# Load annotation hub
+# ah <- AnnotationHub()
+# 
+# # Search for the correct Ensembl gene annotation
+# query(ah, c("Homo sapiens", "ensembl", "GRCh38"))
+# 
+# # Using Ensembl release (hg18)
+# ensDb_38 <- ah[["AH78783"]]
+# genes_38 <- genes(ensDb_38)
+# # pull the info I want
+# genes_38 <- genes_38@elementMetadata
+# genes_38 <- genes_38[, c("gene_id", "gene_name", "gene_biotype", "entrezid")]
+
+# saveRDS(genes_38, file = here("cleanData/genes_38.Rds"))
+
+genes_38 <- readRDS(file ="cleanData/genes_38.Rds")
+
+# create an object of protein coding genes
+protein_coding <- dplyr::filter(data.frame(genes_38), gene_biotype == "protein_coding")
+rownames(protein_coding) <- protein_coding$gene_id
+
+# create an object for genes with an entrez gene ID
+entrez_id <- data.frame(genes_38)[!is.na(genes_38$entrezid), ]
+rownames(entrez_id) <- entrez_id$gene_id
+
+# Retrieve gene annotation information from BioMart
+# ## default mirror
+ensembl <- biomaRt::useEnsembl(biomart = "ensembl",
+                               dataset = "hsapiens_gene_ensembl",
+                               mirror = "www")
+
+# pull the information
+geneInfo <- biomaRt::getBM(mart = ensembl,
+                           attributes = c("ensembl_gene_id", "chromosome_name",
+                                "hgnc_symbol", "entrezgene_id", "gene_biotype", 
+                                "go_linkage_type"),
+                           filters = c("ensembl_gene_id",
+                                       "with_entrezgene"),
+                           values = list("ensembl_gene_id" = rownames(grch38_mRNA_placenta_counts),
+                                         "with_entrezgene" = TRUE)
+                           )
+
+```
+
+## Plot read raw counts
+
+Here I am plotting the raw read counts from each of the libraries to see which if any of the samples may have failed sequencing.
+I have established a 9 million read count threshold and will remove any samples that do not meet this bench mark.
+
+```{r plot raw gene counts, fig.cap="Raw read counts from the RNA-seq libraries from the SCOPE and STOP placenta dataset. Cutoff for total read counts set at 9 million reads."}
+
+# Quick plot to look at the sum of raw counts for each sample
+plotData_rawReads <- grch38_mRNA_placenta_counts %>% 
+  colSums(.) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column() %>%
+  set_colnames(c("sample", "totalCounts")) %>% 
+  arrange(., totalCounts)
+
+ggplot(data = plotData_rawReads,
+       aes(x = reorder(sample, totalCounts),
+           y = totalCounts,
+           colour = totalCounts < 9000000)) +
+  geom_point(size = 5) +
+  scale_colour_manual(name = 'Read count\nthreshold',
+                      values = setNames(c('red','green'),
+                                      c(TRUE, FALSE))) +
+  geom_hline(yintercept = 9000000,
+             show.legend = FALSE,
+             linetype = "dotted",
+             colour = "red") +
+  geom_text_repel(data = dplyr::filter(plotData_rawReads, totalCounts<9000000),
+                  aes(label = sample),
+                  show.legend = FALSE,
+                  max.overlaps = Inf) +
+  ggtitle("Raw counts placenta - all samples\n(hg38)") +
+  theme_bw(base_size = 16) +
+  labs(title = "Library size",
+       subtitle = "Raw mRNA read counts in placenta",
+       x = "Samplename",
+       y = "mRNA read counts") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   hjust = 1.5,
+                                   colour = "black",
+                                   size = 12),
+        axis.text.y = element_text(angle = 0,
+                                   colour = "black",
+                                   size = 14))
+
+# create object containing samples fail read depth QC
+QC_Remove <- dplyr::filter(plotData_rawReads, totalCounts < 9000000) %>%
+  dplyr::select(., name_flowCell = sample)
+
+# keep only STOP and SCOPE
+# remove too small samples
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>%
+  dplyr::select(., -all_of(QC_Remove[[1]]))
+
+# remove the too small samples from the metadata
+placenta_meta <- subset(placenta_meta, name_flowCell %notin% QC_Remove[[1]])
+
+# these three samples converge as outliers
+# 1. PCA
+# 2. SD
+# 3. Aberrant module expression
+dropQC <- c("SCP4157_CDN0JANXX", "STP0148_CDN0JANXX", "STP0596_CDN0JANXX")
+
+placenta_meta <- subset(placenta_meta, name_flowCell %notin% dropQC)
+
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>%
+  dplyr::select(., -all_of(dropQC))
+
+# create object EOPE samples
+EOPE_Remove <- c("SCP3492_CDN0JANXX", "SCP3492_C9FNFANXX")
+
+# remove EOPE sample
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts %>%
+  dplyr::select(., -all_of(EOPE_Remove))
+
+# remove EOPE sample
+placenta_meta <- subset(placenta_meta, name_flowCell %notin% EOPE_Remove)
+
+
+```
+
+## MT Genes
+
+We're not interested in mitochondial or Y chromosome genes here so these will be removed.
+
+```{r remove MT genes}
+
+# create a table with only MT encoded genes
+MTgenes <- geneInfo %>%
+  dplyr::filter(., chromosome_name == "MT" & chromosome_name == "Y")
+
+# drop these MT genes from the count table
+grch38_mRNA_placenta_counts <- grch38_mRNA_placenta_counts[rownames(grch38_mRNA_placenta_counts) %notin% MTgenes$ensembl_gene_id,]
+
+```
+
+# Initiate the DGElist object
+
+```{r DGEList mRNA}
+
+# establish the DGEList
+DGElist_mRNA_38 <- DGEList(counts = grch38_mRNA_placenta_counts,
+                           samples = placenta_meta,
+                           genes = (grch38_mRNA_placenta_counts %>% tibble::rownames_to_column())[,1,drop=FALSE])
+
+# load the gene info library
+library(org.Hs.eg.db)
+DGElist_mRNA_38$genes$Symbol <- mapIds(org.Hs.eg.db,
+                                       keys = rownames(DGElist_mRNA_38),
+                                       keytype = "ENSEMBL",
+                                       column = "SYMBOL")
+# view head and tail of gene list
+head(DGElist_mRNA_38$genes)
+tail(DGElist_mRNA_38$genes)
+
+# drop the 'genes' without official gene symbols
+DGElist_mRNA_38 <- DGElist_mRNA_38[!is.na(DGElist_mRNA_38$genes$Symbol), ]
+
+# check the dimensions
+dim(DGElist_mRNA_38)
+
+```
+
+## Filtering
+Filter genes with low expression or low variability reduces the number of genes considered in the WGCNA analysis.
+Genes with low expression or low variability are not informative and make interpretation more difficult.
+
+```{r filter genes for low expression and low variance}
+
+# Retain genes which are expressed at sufficiently high levels, at least 2 cpm in samples with PE `numSamples`.
+numSamples <- dim(dplyr::filter(DGElist_mRNA_38$samples, Outcome == "PE"))[1]
+keepTheseGenes <- rowSums(cpm(DGElist_mRNA_38) > 2) >= numSamples
+
+# Retain genes with sufficiently high variation in expression across all samples.
+# Here we define sufficiently high variation as having a standard deviation above the 70th quantile (so not in bottom 30%).
+variableGenes <- rowSds(cpm(DGElist_mRNA_38, log=TRUE)) > quantile(rowSds(cpm(DGElist_mRNA_38, log=TRUE)), 0.3)
+
+# Perform the filtering step and recalculate the TMM normalisation factors for each library.
+DGElist_mRNA_38 <- DGElist_mRNA_38[keepTheseGenes&variableGenes,,keep.lib.sizes = FALSE]
+
+```
+
+After filtering out low expressed genes and low variance genes, each RNA-seq library contains `r dim(DGElist_mRNA_38$counts)[1]` genes compared to the original `r dim(grch38_mRNA_placenta_counts)[1]` genes. 
+The distributions of gene counts in each RNA-seq library after normalization and filtering are shown in the following boxplots in Figure \@ref(fig:WGCNA-Boxplots-Filtered-Gene-Expression) and \@ref(fig:WGCNA-Boxplots-Filtered-Normalised-Gene-Expression). 
+
+```{r WGCNA-Boxplots-Filtered-Gene-Expression, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Effect of TMM (Trimmed Mean of M-values) normalisation followed by filtering out low expression and low variance Genes on the gene expression distributions for each RNA-seq library in the SCOPE and STOP dataset."}
+
+DGElist_mRNA_38 %>% 
+  cpm(log = TRUE) %>%
+  melt() %>% 
+  left_join(DGElist_mRNA_38$samples, by = c("Var2" = "name_flowCell")) %>% 
+  ggplot(aes(x=factor(as.character(Var2),
+                      levels = unique(Var2)),
+             y = value,
+             fill = as.factor(group))) + 
+  geom_boxplot(outlier.colour = "#888888",
+               outlier.size = 0.25, 
+               notch = TRUE,
+               outlier.fill = NULL,
+               outlier.shape = 19,
+               show.legend = FALSE) +
+  labs(x = "RNA-seq Library",
+       y = "logCPM Gene Count",
+       fill = "group") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 18),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  facet_wrap(~flowCell + Sex,
+             scales = "free_x",
+             ncol = 4) 
+
+```
+
+## TMM normalisation of libraries
+
+```{r WGCNA-Boxplots-Filtered-Normalised-Gene-Expression, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Effect of TMM (Trimmed Mean of M-values) normalisation followed by filtering out low expression and low variance genes on the gene expression distributions for each RNA-seq library in the SCOPE and STOP dataset."}
+
+# calculate normalisation factors and apply to the DGEList object
+DGElist_mRNA_38 <- calcNormFactors(DGElist_mRNA_38, method = "TMM")
+
+# plot the distriribution of counts
+DGElist_mRNA_38 %>% 
+  cpm(log = TRUE) %>%
+  melt() %>% 
+  left_join(., DGElist_mRNA_38$samples, by = c("Var2"="name_flowCell")) %>% 
+  ggplot(aes(x = factor(as.character(Var2),
+                      levels=unique(Var2)),
+             y = value,
+             fill = as.factor(group))) + 
+  geom_boxplot(outlier.colour = "#888888",
+               outlier.size = 0.25, 
+               notch = TRUE,
+               outlier.fill = NULL,
+               outlier.shape = 19,
+               show.legend = FALSE) +
+  labs(x = "RNA-seq Library",
+       y = "logCPM Gene Count",
+       fill = "group") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 18),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  facet_wrap(~flowCell + Sex,
+             scales = "free_x",
+             ncol=4) 
+
+```
+
+## Genes and Samples driving variability
+
+Given the variability across the term complicated and term uncomplicated samples, there is likely to be a substantial number of genes that are differentially expressed between these two groups, or between male and female bearing pregnancies. Consequently, a differential expression analysis may often potentially mask subtle changes in gene expression across samples. This is especially true in a dataset that runs 80 samples, which is a lot. Previously, a sex-specific DE analysis was run finding signifcant DE in the male but not the female PE-uncomplicated contrasts. Given this lack of statistical power in the female comparison, we determined it would be valuable to run a co-expression analysis, such as a *WGCNA*, to identify eigengenes (see below) that have the same expression profile, and therefore are likely to be associated with similar functions. Instead, sample-to-sample distances can be examined to determine whether there are any groupings  based on the gene expression profile. 
+
+```{r figure 1 - sample distances, fig.width = 7, fig.height = 5}
+
+lcpm <- cpm(DGElist_mRNA_38, log = TRUE)
+sampleDists <- dist(t(lcpm))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+annotation_row <- data.frame(age = as.integer(DGElist_mRNA_38$samples$GestationalAge),
+                             outcome = DGElist_mRNA_38$samples$Outcome)
+rownames(annotation_row) <- DGElist_mRNA_38$samples$name_flowCell
+
+pheatmap(sampleDistMatrix,
+         annotation_col = annotation_row,
+         cutree_rows = 4,
+         cutree_cols = 4,
+         show_rownames = FALSE)
+
+```
+
+## Create a sample-sample network
+One of the first things we can do is to see if we have samples that cluster and whether these clusters associate with our traits of interest
+
+```{r sample sample network}
+
+# Create an adjacency matrix of log2 transformed counts (squared Euclidean distance)
+# counts need to be samples in columns and genes in rows for this
+adjacency <- WGCNA::adjacency(edgeR::cpm(DGElist_mRNA_38,
+                                         log = TRUE),
+                              type = "distance")
+
+#calculate the whole network connectivity
+k <- as.numeric(apply(adjacency,2,sum))-1
+# standardise connectivity
+Z.k <- scale(k)
+
+# Designate samples as outlying if their Z.k value is below threshold
+thresholdZ.k <- -2.5 # often -2.5 - indicates standard deviations away from other samples when is outlier
+
+# colour the vector indicating outliers
+outlierColour <- ifelse(Z.k < thresholdZ.k, "red", "black")
+
+# calculate the cluster tree using flashClust
+## dis-similarity matrix calculated as 1-adjacency matrix
+sampleTree <- flashClust::flashClust(as.dist(1-adjacency),
+                     method = "average")
+
+# convert traits to colour representation
+# where red indicates high values
+# create an object of the sample metadata
+samples <- DGElist_mRNA_38$samples %>%
+  # remove unwanted columns
+  dplyr::select(., -norm.factors,
+                -samplename,
+                -reportedOutcome,
+                -deliveryMode,
+                -otherID,
+                -SampleID,
+                -jimmyBatch,
+                -R_samplename,
+                -RIN,
+                -name_flowCell)
+
+# convert characters to factors and set factor levels
+samples$cohort <- factor(samples$cohort, c("SCOPE", "STOP"))
+samples$Sex <- factor(samples$Sex, c("M", "F"))
+samples$SmokingStatus <- factor(samples$SmokingStatus, c("N", "Y"))
+samples$Ethnicity <- factor(samples$Ethnicity, c("Caucasian",
+                                                 "Aboriginal",
+                                                 "SouthEastAndFarEast",
+                                                 "Asian",
+                                                 "Polynesian"))
+samples$machineID <- factor(samples$machineID, c("HWI-ST1408", "HWI-ST1101", "D00615"))
+samples$flowCell <- factor(samples$flowCell, c("C9FNFANXX", "C2BK8ACXX", "CDN0JANXX", "C9WE0ANXX"))
+samples <- samples %>%
+  # convert factors to numeric for colour assignment
+  mutate_if(is.factor, as.numeric)
+
+# convert numbers to colours
+traitColours <- data.frame(numbers2colors(samples, signed = FALSE))
+dimnames(traitColours)[[2]] <- paste(names(samples), "C", sep = "")
+datColours <- data.frame(outlierC = outlierColour, traitColours)
+
+# Plot the sample dendrogram and the colours underneath
+WGCNA::plotDendroAndColors(sampleTree,
+                    groupLabels = names(datColours),
+                    colors = datColours,
+                    main = "Sample Dendrogram and Heatmap")
+
+
+
+```
+
+Another approach to visualise any groupings occuring based on the gene expression profile is to calculate the similarities (or distances) that may be present between the samples. The `plotMDS` function used takes the root-mean-square deviation, or *Euclidean* distance for the top set of genes present within each sample. Hence the log2-fold-change of those top genes, or leading log2-fold-change, for each sample determining the distances between samples. There is a strong indication of sequence batch and also fetal sex, which is understandable given the differences we expect between male and female. No strong PE signal, but some clustering.
+
+```{r figure 1 - mds}
+
+mds <- plotMDS(DGElist_mRNA_38, plot = FALSE)
+
+# calculate MDS data
+MDS <- plotMDS(edgeR::cpm(DGElist_mRNA_38,
+                          log = TRUE, prior.count = 5),
+               main = "MDS norm counts")
+
+data.frame(mds$x, mds$y) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "name_flowCell") %>%
+  inner_join(DGElist_mRNA_38$samples, by = "name_flowCell") %>%
+  ggplot(aes(x = mds.x,
+             y = mds.y,
+             colour = Sex,
+             shape = Outcome)) +
+  geom_point(size = 6) +
+  geom_text_repel(aes(x = mds.x,
+                y = mds.y,
+                label = samplename,
+                colour = Sex),
+                max.overlaps = Inf,
+            show.legend = FALSE) +
+  labs(title = "MDS plot normalised counts - mRNA GRCh38 \nplacenta",
+       y = "DIM 2",
+       x = "DIM 1") +
+  theme_bw()
+
+```
+
+# **WGCNA: gene co-expression analysis**
+
+## Batch correction of libraries
+
+The data we are using here comes from a number of different sequencing runs. To account for this batch effect I will use _limma::removeBatchEffect_.
+I am interested in biological differences due to outcome and fetal sex. The _limma::removeBatchEffect_ function allows for the inclusion of a design matrix for factors to be preserved. This method is implemented here. 
+
+```{r limma remove batch effects}
+
+# this design contains treatment conditions to be preserved
+# it contains all the experimental factors excluding the batch effect
+design <- formula(~Outcome + Sex)
+modelMatrix <- model.matrix(design,
+                            data = DGElist_mRNA_38$samples)
+
+bcc_grch38 <- limma::removeBatchEffect(cpm(DGElist_mRNA_38,
+                                           log = TRUE, 
+                                           prior.count = 3),
+                                       batch = factor(DGElist_mRNA_38$samples$flowCell),
+                                       design = modelMatrix) %>% 
+  t()
+
+# establish list object for downstream analyses
+bcc_grch38_list <- list(grch38 = bcc_grch38)
+
+```
+
+## 1. Network Construction
+
+Prior to identifying which genes are correlated with each other, need to select a soft power threshold
+
+The first step in constructing a scale-free gene co-expression requires choosing a soft-thresholding power. 
+
+Here, we test a range of possible soft-thresholding powers to find the minimum one which results in approximately [scale-free topology](https://en.wikipedia.org/wiki/Scale-free_network) for the male and female gene expression networks. We define an appropriate minimum scale-free topology fitting index *R<sup>2</sup>* to be at least 0.80. This step takes a couple of mins to run. 
+
+```{r Choose-Soft-Thresholding-Power, message=FALSE, warning=FALSE}
+
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+sftList <- lapply(bcc_grch38_list, function(x){
+  pickSoftThreshold(x, 
+                    powerVector = powers,
+                    verbose = 0,
+                    networkType = "signed", 
+                    RsquaredCut = 0.8)
+  }
+)
+
+ggplot(sftList[[1]]$fitIndices, mapping = aes(x= Power, y= SFT.R.sq, color="red")) +
+  geom_point() +
+  theme_bw() +
+  guides(color=FALSE) +
+  xlab("Soft Threshold (power)") +
+  ylab("Scale Free Topology Model Fit,signed R^2") +
+  ggtitle("Scale independence")
+    
+ggplot(sftList[[1]]$fitIndices, mapping = aes(x= Power, y= median.k., color = "red")) +
+  geom_point() + 
+  theme_bw() +
+  guides(color=FALSE) +
+  xlab("Soft Threshold (power)") +
+  ylab("Mean Connectivity") +
+  ggtitle("Mean connectivity")
+```
+
+The `pickSoftThreshold` function suggests the most appropriate soft-thresholding power to be used in network construction. `r sftList[[1]]$powerEstimate` is the soft-thresholding power suggested.
+
+Next the adjacency matrix will be created for the formation of the gene co-expression network
+
+:   The **adjacency matrix** is a matrix that where the genes are both the columns and rows and the matrix is filled with the correlation value between each pair of genes.
+
+In developing a network, the direction of the correlation of genes is important. The stringency applied when identifying biologically significant modules will increase by only identifying those genes which are positively correlated with one another.
+
+```{r Generation of the adjacency matrices}
+
+adjacenceList <- lapply(1:length(bcc_grch38_list),
+                       function(x){
+  adjacency(bcc_grch38_list[[x]],
+            power = sftList[[x]]$powerEstimate,
+            type = "signed")
+})
+
+```
+
+## 2. Identifying modules (groups of co-expressed genes)
+
+Using topological overlap measurement
+Once the network has been constructed, the detection of modules, or groups of co-expressed genes, is the next logical step. As such, modules are defined as clusters of densley interconnected genes, several measures of network interconnectedness exist the **topological overlap measure** (TOM) is used here.
+
+The TOM can be used to cluster genes to form a "gene tree" where clusters of genes can be seen as leaves from the tree. The large matrix of distances between each gene and every other gene can be sorted into these clusters via TOM and hierarchical clustering.
+
+When creating the modules, opt for larger modules for certainty that the genes are actually positively correlated, and so set `minModuleSize` to `50`. Then perform module identification using a hybrid adaptive tree cut
+
+Finally convert numeric lables into colours for preparation of plotting the dendrograms of the clustered modules using `labels2colors`
+
+```{r Generation of TOM matrix}
+
+TOMList <- lapply(adjacenceList, function(x){
+                    TOMsimilarity(x, TOMType = "signed")
+  });
+
+dissTOMList <- lapply(TOMList, function(x){
+                        1 - x
+  })
+
+geneTreeList <- lapply(dissTOMList, function(x) { hclust(as.dist(x), method = "average") } )
+
+minModuleSize = 50;
+
+dynamicModsList <- lapply(1:length(geneTreeList), function(x){
+  cutreeHybrid(dendro = geneTreeList[[x]], 
+               distM = dissTOMList[[x]],
+               minClusterSize = minModuleSize,
+               deepSplit = 0,
+               pamStage = FALSE,
+               maxPamDist = 0.90,
+               verbose = 0)
+  }
+)
+
+names(dynamicModsList) <- "grch38_placenta"
+
+dynamicColorsList <- lapply(dynamicModsList, function(x){labels2colors(x$labels)})
+
+```
+
+Note each module is assigned a colour and **grey represents a module containing non-specific co-expressed genes**. Genes within this module are unlikely to have much relationship to each other therefore this module is ignored in many downstream analysis.
+
+In the following steps, module eigengenes and the distances between them are calculated and stored in the list object `MEList`.  Module eigengenes are defines as:
+
+For each gene cluster, the first principle component (which is commonly referred to as a **module eigengene**), is calculated which permits summarisation of the expression pattern of the module of interest. 
+
+:   The module eigengene can be used to correlate the expression of the module with phenotype or biological trait of interest. 
+
+Dissimilarity of module eigengenes are calculated and stored in `MEsList` and module eigengenes are subsequently clustered into `METreeList`. The recommended distance cutoff to merge modules is 0.25, which corresponds to a correlation of 0.75. Hence the distance threshold, `MEDissThres`, is set to 0.25 and modules differentiating below the threshold will subsequently be merged. The clustering of the placenta modules is then visualised with the distance threshold
+
+```{r module eigengenes thresholds, results='hide'}
+
+MEList <- lapply(1:length(dynamicColorsList), function(x){
+  WGCNA::moduleEigengenes(bcc_grch38_list[[x]], colors = dynamicColorsList[[x]])
+                   }) %>% set_names("grch38_placenta")
+
+MEsList <- lapply(MEList, function(x){x$eigengenes})
+
+MEDissList <- lapply(MEsList, function(MEs){1-cor(MEs)})
+
+METreeList <- lapply(MEDissList, function(x){hclust(as.dist(x), method = "average")})
+
+MEDissThres = 0.25
+
+sizeGrWindow(7, 6)
+
+plot(METreeList[[1]], main = "Clustering of placenta modules",
+     xlab = "", sub = "")
+abline(h = MEDissThres, col = "red") 
+
+```
+
+The distance threshold is the threshold in which closely related modules, that can subsequently be merged, are idententified. Merging closely related modules is essential as it allows the identification and definition of modules that are truly distinct, and also saves computation time and memory resources.
+
+```{r supplementary - cluster dendogram, results='hide' , warning=FALSE, message=FALSE}
+
+mergeList <- lapply(1:length(bcc_grch38_list), function(x){mergeCloseModules(bcc_grch38_list[[x]],
+                                                       dynamicColorsList[[x]],
+                                                       cutHeight = 0.25, 
+                                                       verbose = 3)})
+
+names(mergeList) <- "grch38_placenta"
+
+mergedColorsList <- lapply(mergeList, function(x){x$colors})
+
+plotDendroAndColors(geneTreeList[[1]],
+                    cbind(dynamicColorsList[[1]], mergedColorsList[[1]]),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+## 3 Identifying Biological signal of modules
+
+Knowing which genes are located in each module allows extraction of more in-depth biological information about each module, such as biological pathways that are enriched what cellular processes are being driven. This can provide insights into the function of the module. By using the annotations from `AnnotationHub` gene databases, gene ontology analyses can be conducted on the modules. 
+
+```{r Annotation of gene modules, warning=FALSE, messasge=FALSE }
+
+matchGenesToGO <- geneInfo %>%
+    dplyr::filter(go_linkage_type != "" & ensembl_gene_id %in% colnames(bcc_grch38_list[[1]])) %>%
+    distinct(ensembl_gene_id, .keep_all = TRUE) %>%
+    tibble::column_to_rownames("ensembl_gene_id") %>%
+    magrittr::extract(colnames(bcc_grch38_list[[1]]), ) %>% 
+    tibble::rownames_to_column("ensembl_gene_id")
+
+matchGenesToGOOrderedList <- matchGenesToGO[match(matchGenesToGO$ensembl_gene_id,
+                                                  colnames(bcc_grch38_list[[1]])),]
+
+```
+
+Create a collection with Gene Ontology (GO) terms for the Homo sapiens. Within this collection, four groups of GOs are defined: `GO` for all terms, `GO.BP` for terms that are biological processes, `GO.MF` for molecular function terms, and for `GO.CC` terms which are cellular component terms.
+
+:  Biological processes refer to the larger overall processes which are made up of a series of molecular activities.
+
+:  Molecular functions can be broadly defined as activities performed by gene products at the molecular level. It is important to note that the molecular function terms refer to the *activities* of entities or molecules rather than the *physical* definition of these.
+
+:  Cellular Components refer to the locations relative to a cellular component in which a gene product executes a function. These terms differ from the other two classes as they refer to cellular anatomy rather than an action or process.
+
+
+```{r define GO collection}
+GOcollection <- suppressMessages(buildGOcollection(organism = "Hs"))
+```
+
+## Enrichment Analysis
+
+Perform the enrichment analysis on the genes and their respecitve modules. The module colour list is provided as `classLabels` and importantly entrez gene IDs as identifiers. As there are `r length(matchGenesToGOOrderedList$entrezgene_id)` IDs, the list can be considered representative of a fairly complete gene set for the organism, hence the background is set to `"intersection"`
+
+```{r GO enrichment, echo=FALSE, warning=FALSE, message=FALSE, results="hide"}
+
+GOenrList <- lapply(1:length(bcc_grch38_list), function(x){
+  enrichmentAnalysis(classLabels = mergedColorsList[[x]],
+                     identifiers = matchGenesToGOOrderedList$entrezgene,
+                      useBackground = "intersection",
+                      removeMissing = TRUE,
+                      getFDR = TRUE,
+                      refCollection = GOcollection,
+                      maxReportedOverlapGenes = Inf)
+})
+
+names(GOenrList) <- names(mergedColorsList)
+```
+
+The `GOenrList` object that was just created may seem rather large and difficult to work with. A neat little function is defined to extract the relevant information from the output of the `enrichmentAnalysis()` by first filtering by false discovery rate, selecting relevant columns, setting more meaningful names. White spaces are also replaced with underscores.
+
+```{r form enrichment tables list}
+
+topAnalysis <- function(x, fdr = 1) {
+  x %>% 
+    
+    use_series("enrichmentTable") %>%
+    
+    dplyr::filter(FDR < fdr) %>% 
+    
+    dplyr::select(class, dataSetID, dataSetName,
+                  pValue, FDR, overlapGenes,
+                  inGroups, shortDataSetName) %>% 
+    
+    dplyr::rename(Module = class,
+                  ID = dataSetID,
+                  category = inGroups,
+                  name = shortDataSetName,
+                  term = dataSetName, 
+                  pval = pValue,
+                  adj_pval = FDR,
+                  genes = overlapGenes) %>%
+    
+    mutate(genes = gsub(x = genes, pattern = "\\|", replacement = ", "),
+           category = gsub(x = category, pattern = "GO\\|GO\\.", replacement = ""),
+           name = gsub(x = name, pattern = "_", replacement = " "))
+}
+enrichedTablesList <- lapply(GOenrList, topAnalysis)
+
+```
+
+The `enrichedTablesList` now contains information about the GO pathway for each gene, which module the genes related to, the statistical significance resulting from the enrichment analysis, and the corresponding entrez gene IDs for each gene. The gene symbols are missing from this set and so a function is defined which can join these symbols into the dataset. The `geneInfo` dataset contains gene annotations that can be used to join the gene symbols to the enriched table list. Once the gene symbols are retrieved from the Entrez IDs, paste over them in `enrichedTablesList`
+
+```{r make EnrTable more accessible}
+
+EntrezToSymbol <- lapply(enrichedTablesList, function(u){
+  
+  SplitCharcterStringsByComma <- lapply(u$genes,
+                                        function(q) { strsplit(x = q, split = ",") }
+                                        )
+  
+  RemoveWhiteSpacesInNames <- lapply(SplitCharcterStringsByComma, 
+                                     function(x) { 
+                                       gsub(pattern = " ",
+                                            replacement = "",
+                                            x = x[[1]])
+                                       })
+  
+  ExtractGeneSymbolNamesBasedOnEntrez <- lapply(RemoveWhiteSpacesInNames,
+                                                function(t) {
+                    geneInfo$external_gene_name[geneInfo$entrezgene_id %in% t] %>% 
+                                                    unique()
+   })
+  
+  ConvertedBackToStringAndDelistedForDF <- lapply(ExtractGeneSymbolNamesBasedOnEntrez, 
+                                                  toString) %>% 
+    unlist()
+  
+  return(ConvertedBackToStringAndDelistedForDF)
+  
+})
+
+enrichedTablesList$grch38_placenta$genes <- EntrezToSymbol$grch38_placenta
+
+enrichedTablesList$grch38_placenta%>%
+  arrange(adj_pval) %>%
+  dplyr::select(c("Module", "ID", "term", "pval", "adj_pval")) %>%
+  group_by(Module) %>%
+  top_n(5) %>%
+  arrange(Module)
+
+pander(head(enrichedTablesList$grch38_placenta, n = 20), split.table = Inf)
+
+go_enrich <- dplyr::filter(enrichedTablesList$grch38_placenta, adj_pval < 0.01) %>% 
+  group_by(Module) %>% 
+  dplyr::arrange(., category, .by_group = TRUE)
+
+```
+
+
+## Correlation of Modules with Biological Traits
+
+In order to identify which modules are of biological significance and which traits they are significant in, first calculate and then correlate the module eigengenes with the phenotypic trait of interest being studied in each experiment.
+
+Modules that are significantly associated with measured clinical traits need to be identified. In this case, the measured "trait" is **Gestational Age**. Since the merged modules are already on hand, the calculation of eigengenes from each module and correlate those eigengenes with traits to look for the most significant associations is the next logical step.
+
+Here define the traits in a model matrix and calulate the module eigen genes after merging the modules, using the same **soft-power** defined in Section 1
+
+```{r Module correlation}
+
+traits <- model.matrix(~0 + Outcome , data = DGElist_mRNA_38$samples) %>% 
+  set_colnames(c("Control", "PE"))
+
+traitsList <- list(placenta_outcome = traits)
+
+MEListTraits <- lapply(1:length(bcc_grch38_list), function(x){
+  moduleEigengenes(bcc_grch38_list[[x]], 
+                   colors = mergedColorsList[[x]],
+                   softPower = sftList[[x]]$powerEstimate) %>%
+    use_series("eigengenes") %>%
+    orderMEs()
+  })
+
+```
+
+With the eigengenes (`MEListTraits`) from the previous step, correlate them with the traits in (`traitsList`) to quantify module-trait associations.
+
+Student correlation p-values between the sample groups and module eigengenes are calculated here to determine modules which are exhibiting differences when tested across gestational age.
+
+```{r Calulating the correlation stastics for gestational age}
+
+moduleTraitCor_HybridCutList <- lapply(1:length(MEListTraits), function(x){
+  bicorAndPvalue(x = MEListTraits[[x]], 
+                 y = traitsList[[x]], 
+                 robustY = FALSE, 
+                 maxPOutliers = 0.05)
+})
+
+names(moduleTraitCor_HybridCutList) <- names(MEList)
+
+moduleTraitCor_HybridCutList <- lapply(1:length(moduleTraitCor_HybridCutList),
+                                       function(x){
+  colnames(moduleTraitCor_HybridCutList[[x]]$bicor) <- gsub(x = colnames(moduleTraitCor_HybridCutList[[x]]$bicor),
+                                                                     pattern = "CellType",
+                                                                     replacement = "")
+  return(moduleTraitCor_HybridCutList[[x]])
+})
+
+names(moduleTraitCor_HybridCutList) <- names(MEList)
+
+```
+
+Create a text matrix with same dimensions as the heatmap, which includes the correlation coefficient and p-value for correlation. Defining and using this object will allow the correlation information to be displayed within its correspond tile in the heatmap, adding extra depth to the information being displayed. Module colours are defined as the row labels. 
+
+```{r Plot module correlations - figure 3, fig.height=8, fig.width=10, fig.pos="centre", message=FALSE, warning=FALSE}
+
+textMatrix_HybridCutList <- lapply(moduleTraitCor_HybridCutList, function(x){
+  textMatrix_HybridCut<- paste(signif(x$bicor, 2), "\n(", 
+                              signif(x$p, 1), ")", sep = "")
+dim(textMatrix_HybridCut) <- dim(x$bicor)
+return(textMatrix_HybridCut)
+})
+
+colnames(textMatrix_HybridCutList$grch38_placenta) <- colnames(moduleTraitCor_HybridCutList$grch38_placenta$bicor)
+rownames(textMatrix_HybridCutList$grch38_placenta) <- rownames(moduleTraitCor_HybridCutList$grch38_placenta$bicor)
+
+RownamesData <-  gsub(x = rownames(moduleTraitCor_HybridCutList[[1]]$bicor),
+                               pattern = "ME", replacement = "")
+
+pheatmap(moduleTraitCor_HybridCutList$grch38_placenta$bicor,
+  labels_row = RownamesData,
+  border_color = "white", 
+  treeheight_row = 50, 
+  treeheight_col = 0,
+  cutree_rows = 5,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation", 
+  cluster_cols = FALSE,
+  number_color = "black",
+  fontsize = 12,
+  display_numbers = textMatrix_HybridCutList$grch38_placenta,
+  gaps_col = 1,
+  legend.cex = 1)
+
+```
+
+**Correlation of Modules with Fetal Sex**
+
+In this section, the same analysis is performed as above. Here below is a what is described above as the main purpose of this section of the analysis:
+
+*In order to identify which of the modules are of biological significance and which traits they are significant in, first calculate and then correlate the module eigengenes with the phenotypic trait of interest being studied in each experiment.*
+
+Indentify modules that are significantly associated with the measured clinical traits. In this case, the measured "trait" is **fetal sex** this time (previously looked at **Gestational Age**). As with last time, closely related modules have already been merged, and so the next step is the calculation of the module eigengenes and correlating those eigengenes with biological traits to test for the most significant associations.
+
+In next section, the module trait correlations with fetal sex are calculated. The traits are defined in a model matrix list object. Then the Student correlation p-values are calculated. The names are adjusted afterwards.
+
+```{r Calculating the correlation stastics for sex traits}
+
+traitsSex <- model.matrix(~0 + Sex , data = DGElist_mRNA_38$samples) %>% 
+  set_colnames(c("Female", "Male"))
+
+traitSexList <- list(placenta_Sex = traitsSex)
+
+MEListTraits <- lapply(1:length(bcc_grch38_list), function(x){
+  moduleEigengenes(bcc_grch38_list[[x]], 
+                   colors = mergedColorsList[[x]],
+                   softPower = sftList[[x]]$powerEstimate) %>%
+    use_series("eigengenes") %>%
+    orderMEs()
+  })
+
+moduleTraitCorSex_HybridCutList <- lapply(1:length(MEListTraits), function(x) {
+  bicorAndPvalue(x = MEListTraits[[x]], 
+                 y = traitSexList[[x]], 
+                 robustY = FALSE, 
+                 maxPOutliers = 0.05)
+  }
+)
+names(moduleTraitCorSex_HybridCutList) <- names(MEList)
+
+moduleTraitCorSex_HybridCutList <- lapply(1:length(moduleTraitCorSex_HybridCutList),
+                                          function(x) {
+            colnames(moduleTraitCorSex_HybridCutList[[x]]$bicor) <- gsub(
+              x = colnames(moduleTraitCorSex_HybridCutList[[x]]$bicor), 
+              pattern = "CellType",
+              replacement = "")
+  return(moduleTraitCorSex_HybridCutList[[x]]
+         )
+            }
+  )
+names(moduleTraitCorSex_HybridCutList) <- names(MEList)
+
+```
+
+Create a text matrix with same dimensions as the heatmap, which includes the correlation coefficient and p-value for correlation. Defining and using this object will allow the correlation information to be displayed within its corresponding tile in the heatmap, adding extra depth to the information being displayed. Module colours are defined as the row labels. 
+
+```{r  Plot module correlations fetal sex - figure 6, fig.height=6, fig.pos="centre", fig.width=5, message=FALSE, warning=FALSE}
+
+textMatrixSex_HybridCutList <- lapply(moduleTraitCorSex_HybridCutList, function(x){
+  
+  textMatrixSex_HybridCut<- paste(signif(x$bicor, 2), "\n(", 
+                              signif(x$p, 1), ")", sep = "")
+  dim(textMatrixSex_HybridCut) <- dim(x$bicor)
+
+return(textMatrixSex_HybridCut)
+
+})
+
+colnames(textMatrixSex_HybridCutList$grch38_placenta) <- colnames(moduleTraitCorSex_HybridCutList$grch38_placenta$bicor)
+rownames(textMatrixSex_HybridCutList$grch38_placenta) <- rownames(moduleTraitCorSex_HybridCutList$grch38_placenta$bicor)
+
+RownamesData <-  gsub(x = rownames(moduleTraitCorSex_HybridCutList[[1]]$bicor),
+                               pattern = "ME", replacement = "")
+RownamesData <- RownamesData[1:13]
+
+heatData <- moduleTraitCorSex_HybridCutList$grch38_placenta$bicor[1:13,]
+heatLabs <- textMatrixSex_HybridCutList$grch38_placenta[1:13,]
+
+pheatmap(heatData,
+  labels_row = RownamesData,
+  border_color = "white", 
+  treeheight_row = 60, 
+  treeheight_col = 0,
+  cutree_rows = 5,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation", 
+  cluster_cols = FALSE,
+  number_color = "black",
+  fontsize = 12,
+  display_numbers = heatLabs,
+  gaps_col = 1,
+  legend.cex = 1)
+
+```
+
+### Correlating Module Expression to Sample Traits
+signedKME is essentially a `cor()` but adds a bunch of checks for correct data formatting and for non-varying genes or genes with too many missing values. _kME_ calculates the correlation to the module eigengene - _kIM_ is the intermodule connectivity.
+
+It often happens that one gene has a high kME to several modules. Since modules are based on TOM, not on the adjacency (correlations), they provide a slightly different picture of the data which can change the apparent module membership, especially if the modules have strongly correlated eigengenes. TOM also often seems to "prefer" larger modules over small ones. Which one should you settle on? I personally prefer the kME as measured by bicor, but I often settle on simple binary module membership as determined by tree cutting. The point is that the most important genes are those that are intramodular hub genes, and the module to which the hubs belong is usually pretty clear.
+
+kIM and kME values are "similar" in the sense that for each module, the values of kME and kIM for genes in the module tend to be highly correlated. The ability to quickly calculate kME for all genes (not just those within a module) is one of the advantages of kME. Another advantage is that kME values can be directly compared. Since kIM is a sum of connectivities and the number of genes in each module differs, the kIM values across different modules cannot be easily compared
+
+```{r Traits-Design-Matrix, echo=FALSE, message=FALSE}
+
+# ensure metadata binary variables are factors
+DGElist_mRNA_38$samples$SmokingStatus <- factor(DGElist_mRNA_38$samples$SmokingStatus, c("N", "Y"))
+DGElist_mRNA_38$samples$Sex <- factor(DGElist_mRNA_38$samples$Sex, c("M", "F"))
+
+# common design
+design <- formula(~0 + Outcome + Sex + SmokingStatus + BMI + maternalAge + Birthweight)
+
+# male model matrix
+modelMatrix_traits <- model.matrix(design,
+                                 data = DGElist_mRNA_38$samples)
+
+# Which MEs to use for calculating correlation with sample groups:
+MEsForHeatmap <- MEList$HybridCut
+
+# Calculate the hybrid robust-Pearson correlation (suitable for binary variables 
+# if robustY=FALSE) between the sample groups and module eigengenes.
+moduleTraitCor <- bicorAndPvalue(
+  x = MEListTraits[[1]], 
+  y = modelMatrix_traits,
+  # Dealing with binary data: When relating high-throughput data `x` to binary variable `y` such as sample
+  # traits, one can use argument `robustY=FALSE` to turn off the robust treatment for the `y` argument of
+  # `bicor`. This results in a hybrid robust-Pearson correlation as described in [Langfelder and Horvath (2011)]
+  # The hybrid correlation can also be used when one of the inputs is numeric but not known to have any outliers.
+  robustY = FALSE,
+  # Restricting the number of excluded outliers: argument `maxPOutliers`.
+  # 
+  maxPOutliers = 0.05) 
+
+# Create a text matrix with same dimensions as the heatmap, which includes
+# the correlation coefficient and p-value for correlation.
+textMatrix_HybridCut <- paste(signif(moduleTraitCor$bicor, 2), "\n(", 
+                                   signif(moduleTraitCor$p, 1), ")", sep = "")
+dim(textMatrix_HybridCut) = dim(moduleTraitCor$bicor)
+
+# Plot the heatmap
+heatmap_hybridCut  <- pheatmap(
+  moduleTraitCor$bicor,
+  color = colorRampPalette(c("#10c1e5", "#82e0b4", "#F9F9F9", "#FBB829", "#FF0066"))(100), 
+  labels_row = gsub(x = rownames(moduleTraitCor$bicor),
+                    pattern = "ME",
+                    replacement = ""),
+  border_color = "white", 
+  treeheight_row = 50, 
+  treeheight_col = 0,
+  cutree_rows = 5,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation", 
+  cluster_cols = FALSE, 
+  number_color = "black",
+  cellwidth = 15, 
+  cellheight = 15,
+  fontsize = 5,
+  display_numbers = textMatrix_HybridCut,
+  gaps_col = 2
+)
+
+# save_pheatmap_pdf(heatmap_hybridCut, "~/Bioinformatics/github/PhD/placenta_PE/cleanData/moduleHeatmap.pdf")
+
+# pull the information
+new_geneInfo <- biomaRt::getBM(mart = ensembl,
+                           attributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype", "chromosome_name"),
+                           filters = c("ensembl_gene_id",
+                                       "with_entrezgene"),
+                           values = list("ensembl_gene_id" = colnames(bcc_grch38_list$grch38),
+                                         "with_entrezgene" = TRUE)
+)
+
+# Calculate the proportion of variation (in each module) explained by the eigengene
+propExp <- propVarExplained(datExpr = bcc_grch38_list$grch38,
+                                 colors = mergedColorsList[[1]],
+                                 MEs = MEListTraits[[1]],
+                                 corFnc = "bicor",
+                                 corOptions = "use = 'p'")
+
+# find the hub gene for each module
+topHubGenes <- chooseTopHubInEachModule(datExpr = bcc_grch38_list$grch38,
+                                        colorh = mergedColorsList[[1]],
+                                        omitColors = "grey",
+                                        power = 2,
+                                        type = "signed")
+
+# calculate the kME (module membership) for each gene
+kME <- signedKME(datExpr = bcc_grch38_list$grch38,
+                 datME = MEListTraits[[1]],
+                 exprWeights = NULL,
+                 MEWeights = NULL,
+                 outputColumnName = "kME_",
+                 corFnc = "bicor",
+                 corOptions = "use = 'p'") %>%
+  tibble::rownames_to_column("ensembl_gene_id") %>%
+  left_join(., new_geneInfo, by = "ensembl_gene_id") %>%
+              dplyr::select(., ensembl_gene_id, external_gene_name, gene_biotype, everything())
+
+
+```
+
+## Hub connectivity
+
+Intramodular connectivity is the connectivity of nodes to other nodes within the same module. The intramodular connectivity measure is used to define the most highly connected intramodular hub gene as the module representative and can also show intramodular hub genes that are highly correlated with the module eigengene.
+
+The gene connectivity is column bound (via `cbind`) to the gene counts data and the module colours each gene belongs to. The result is a dataset containing a list of genes with information relating to their connectivity with other genes within the same module. Three datasets are created here:
+
+* `topHubGenesTotal` contains the top hub genes from the total connectivity of all genes
+
+* `topHubGenesInModule` are top genes selected by conectivity in each module
+
+* In`topHubGenesTotalAll` it's essentially similar to the table before but contains all the genes as `distinct` hasn't been called on the module and genes
+
+```{r Hub connectivity}
+
+connectivityGenes <- intramodularConnectivity.fromExpr(bcc_grch38_list[[1]],
+                                                       mergedColorsList[[1]],
+                                                       scaleByMax = TRUE)
+
+topHubGenesTotal <- cbind(Gene = colnames(bcc_grch38_list[[1]]), 
+                          Module = mergedColorsList[[1]], 
+                          Connectivity = connectivityGenes) %>%
+  tbl_df() %>%
+  arrange(desc(Connectivity.kTotal)) %>%
+  distinct(Module, .keep_all = TRUE) %>%
+  left_join(geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::select(-Connectivity.kOut, -Connectivity.kDiff) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+topHubGenesTotalAll <- cbind(Gene = colnames(bcc_grch38_list[[1]]), 
+      Module = mergedColorsList[[1]], 
+      Connectivity = connectivityGenes) %>%
+  tbl_df() %>%
+  arrange(desc(Connectivity.kTotal)) %>%
+  left_join(geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::select(-Connectivity.kOut, -Connectivity.kDiff) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+topHubGenesInModule <- cbind(Gene = colnames(bcc_grch38_list[[1]]), 
+                             Module = mergedColorsList[[1]], 
+                             Connectivity = connectivityGenes) %>%
+  tbl_df() %>%
+  arrange(desc(Connectivity.kWithin)) %>%
+  distinct(Module, .keep_all = TRUE) %>%
+  left_join(geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::select(-Connectivity.kOut, -Connectivity.kDiff) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+```
+
+Print the top 5 hub genes by module connectivity. Taking only the first 5 lines of the table for viewing.
+
+```{r Print top 5 genes}
+
+topHubGenesTotalAll %>%
+  group_by(Module) %>%
+  arrange(desc(Connectivity.kWithin)) %>%
+  top_n(5, Connectivity.kTotal) %>%
+  head(n = 14) %>%
+  pander(split.table = Inf)
+
+```
+
+A high connectivity between genes within the same module may mean that module is the most distinct from the rest of the modules. This makes measurement of intramodular connectivity an import property of the formed network. Connectivity is plotted here
+
+```{r supplementary - module connectivity, fig.width = 7, fig.height = 4}
+
+topHubGenesTotalAll %>%
+  dplyr::filter(Module != "grey") %>%
+  ggplot(aes(Module, Connectivity.kTotal, fill = Module)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("black", "blue", "brown", "green", "greenyellow", "grey60", "lightcyan", "lightgreen", "magenta", "red", "tan", "turquoise")) +
+  theme_bw(base_size = 16) +
+  ylab("Intramodular connectivity (kIM)") +
+    theme(axis.text = element_text(colour = "black",
+                                   size = 14)) +
+    theme(legend.position = "none")
+
+```
+
+By binding the connectivity results with the counts data, the module membership of each of the genes can be retrieved. This allows identification of genes that are present within highly distinct modules and what their enriched pathways are, as these may be significant driving factors identified in the network.
+
+```{r connectivity table, fig.height=10, fig.width=15}
+
+moduleGenes <- cbind(Gene = colnames(bcc_grch38_list[[1]]), module = mergedColorsList[[1]]) %>% 
+  tbl_df() %>%
+  left_join(geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::filter(entrezgene_id != "NA") %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  dplyr::select(-go_linkage_type)
+
+cbind(Gene = colnames(bcc_grch38_list[[1]]), module = mergedColorsList[[1]]) %>% 
+  tbl_df() %>%
+  left_join(geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::filter(entrezgene_id != "NA") %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  head(n = 10) %>%
+  pander(split.table = Inf)
+
+```
+
+Now that the module membership is generated and genes from distinct modules have been identified, it is important to find the modules in which the differentially expressed genes are members of and the direction of their expression within the module compared to the other genes present in the modules.
+
+```{r DE modules, fig.height=10, fig.width=15}
+
+deGenes <- readRDS("differentialExpressionFiles/allTable_male_PE.Rds") %>% 
+  tibble::rownames_to_column("Gene")
+
+deGeneModules <- left_join(deGenes, moduleGenes, by = "Gene") %>%
+  dplyr::select(Gene,
+                EntrezID = entrezgene_id,
+                GeneName = gene_name,
+                gene_biotype.x, 
+                module,
+                logFC,
+                AveExpr,
+                FDR = adj.P.Val) %>%
+  dplyr::filter(!is.na(module) & !is.na(EntrezID))
+
+```
+
+Take the top 10 genes in each module and make two plots visualising the direction of expression of all genes within each of the modules
+
+```{r tophub genes plot}
+
+top10Module <- topHubGenesTotalAll %>%
+  group_by(Module) %>%
+  top_n(Connectivity.kTotal, n = 10)
+
+plotData_deGenes <- deGenes %>%
+  left_join(., topHubGenesTotalAll, by = "Gene") %>%
+  dplyr::filter(!is.na(Module)) %>%
+  dplyr::select(Gene,
+                GeneName = gene_name,
+                entrezgene_id = entrezgene_id, 
+                Module,
+                logFC,
+                AveExpr,
+                FDR = adj.P.Val) %>%
+  mutate(Sig = ifelse(FDR < 0.05 & logFC > 0, "Up-regulated",
+                      ifelse(FDR < 0.05 & logFC < -0, "Down-regulated", "Not Significant"))) %>%
+
+    dplyr::filter(Module == "blue" |
+                  Module == "brown" |  
+                  Module == "red")
+  
+p <- ggplot(data = plotData_deGenes,
+         aes(x = logFC,
+             y = -log10(FDR),
+             colour = Sig,
+             label = GeneName)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_vline(xintercept = 0) +
+  facet_wrap(~Module, nrow = 1) +
+  scale_color_manual(values=c("red", "grey", "darkgreen"), name = "Significance") +
+  
+   xlab(expression(paste(log [2], " Fold", " Change"))) +
+   ylab(expression(paste(-log [10], " (FDR)"))) +
+  
+  theme_bw(base_size = 16) +
+  
+  theme(strip.text = element_text(colour = "black",
+                                  size = 14),
+        legend.text = element_text(colour = "black",
+                                   size = 14),
+        legend.title = element_text(colour = "black",
+                                    size = 14)) +
+  theme(legend.position = "bottom")
+ 
+p + geom_label_repel(data = dplyr::filter(plotData_deGenes, Module == "blue") %>% 
+                       dplyr::filter(., Sig != "Not Significant"),
+
+                  aes(x = logFC, y = -log10(FDR), label = GeneName),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE) +
+  
+  geom_label_repel(data = dplyr::filter(plotData_deGenes, Module == "brown") %>% 
+                       dplyr::filter(., Sig != "Not Significant"),
+
+                  aes(x = logFC, y = -log10(FDR), label = GeneName),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE) +
+  
+  geom_label_repel(data = dplyr::filter(plotData_deGenes, Module == "grey") %>% 
+                       dplyr::filter(., Sig != "Not Significant"),
+
+                  aes(x = logFC, y = -log10(FDR), label = GeneName),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE) +
+  
+  geom_label_repel(data = dplyr::filter(plotData_deGenes, Module == "red") %>% 
+                       dplyr::filter(., Sig != "Not Significant"),
+
+                  aes(x = logFC, y = -log10(FDR), label = GeneName),
+                  fill = "white",
+                  max.overlaps = Inf,
+                  show.legend = FALSE)
+                   
+
+```
+
+## Gene network data export
+
+```{r gene network diagram data export}
+
+adjacencyMatrix <- data.frame(adjacenceList[[1]])
+moduleColours <- topHubGenesTotalAll[, 1:2]
+
+geneIDs <- as.data.frame(org.Hs.egENSEMBL) %>%
+  left_join(as.data.frame(org.Hs.egALIAS2EG)) %>%
+  left_join(as.data.frame(org.Hs.egGENENAME)) 
+
+geneIDs <- data.frame(ensembl_id = rownames(adjacencyMatrix)) %>%
+  left_join(., geneIDs, by = "ensembl_id") %>% 
+  left_join(., topHubGenesTotalAll, by = c("ensembl_id" = "Gene"))
+            
+            
+geneIDs %<>% distinct(ensembl_id, .keep_all = TRUE)
+
+# # create the output file required by cytoscape
+# exportNetworkToCytoscape(
+#   adjMat = adjacencyMatrix,
+#   edgeFile = file.path("~/Bioinformatics/github/PhD/placenta_PE/cleanData/cytoscapeFiles/DS0_mod50_tree25_thresh25_edges.tsv"),
+#   nodeFile = file.path("~/Bioinformatics/github/PhD/placenta_PE/cleanData/cytoscapeFiles/DS0_mod50_tree25_thresh25_nodes.tsv"),
+#   altNodeNames = geneIDs$hgnc_symbol,
+#   nodeAttr = geneIDs$Module,
+#   threshold = 0.25
+# )
+
+```
+
+## Specific module gene expression and GO enrichment
+
+Now explore the modules to find out what biolgical information is represented within each one. This is done by checking transcript-per-million (CPM) expression patterns of all genes in each module and enriching for Gene Ontology terms using those genes in the modules.
+
+First get a list of module membership to find out which genes are in which modules which can be done by combining the list of genes with the merged module colour list, and then joining that to the metadata
+
+```{r module membership}
+
+moduleGenes <- cbind(Gene = colnames(bcc_grch38_list[[1]]), module = mergedColorsList[[1]]) %>% 
+  tbl_df() %>%
+  left_join(., geneInfo, by = c("Gene" = "ensembl_gene_id")) %>%
+  dplyr::filter(entrezgene_id != "NA") %>%
+  distinct(Gene, .keep_all = TRUE)  %>%
+  dplyr::select(-go_linkage_type)
+
+```
+
+Plot the average expression of genes, normalised by the average counts-per-million (CPM), for each outcome. Modules with the highest level of gene expression may be driving certain biological processes and is an important property of the network that was created.
+
+```{r DE driving biology}
+
+moduleExpr <- as.data.frame(bcc_grch38_list[[1]]) %>% 
+  tibble::rownames_to_column(var = "name_flowCell") %>%
+  left_join(dplyr::select(DGElist_mRNA_38$samples,
+                          name_flowCell, Outcome),
+            by = "name_flowCell") %>%
+  dplyr::select(., name_flowCell, Outcome, everything()) %>% 
+  reshape2::melt(id.var = c("name_flowCell", "Outcome")) %>% 
+  mutate(Gene = as.character(variable),
+         Outcome = as.factor(Outcome)) %>%
+  mutate(value = as.numeric(value)) %>%
+  inner_join(., moduleGenes,
+             by = "Gene") %>%
+  dplyr::select(name_flowCell,
+                Outcome,
+                module,
+                entrezgene_id,
+                hgnc_symbol,
+                variable,
+                value)
+
+moduleExpr %>%
+  mutate(variable = as.character(variable)) %>%
+  ggplot(aes(Outcome, value, fill = module), colour = "black") +
+  stat_summary(fun="mean", geom="bar") +
+  facet_wrap(~module) +
+  scale_fill_identity() +
+  # scale_x_discrete(breaks=c(10, 15, 20)) +
+  ylab("Average normalised expression (CPM)") +
+  xlab("Outcome") +
+  theme_bw(base_size = 16)
+
+```
+
+
+## MSigDB enrichment of module genes
+
+Next use the annotations from **MsigDB** to enrich for Gene Ontology categories and terms within the defined modules, using the information about module gene membership.
+
+In the next few chuncks of code enrich for Gene Ontology categories under FDR control. First define a gene *universe* containing all the gene ensembl IDs and entrez IDs. Then perform the GO enrichment for each category.
+
+Check the amounts of genes in each module
+
+```{r genes in each module}
+
+table(moduleGenes$module) %>% as.data.frame()
+
+with(dplyr::filter(topHubGenesTotalAll, Module != "grey"), table(Module = Module, Chromosome = chromosome_name))
+
+```
+
+The universal set of genes is defined using the IDs present within the filtered counts data set used in the co-expression analysis. The genes that are now the background set for enrichment functions will be only those used in the previous analysis.
+
+```{r define universal set}
+
+# pull the information
+universal <- biomaRt::getBM(mart = ensembl,
+                            attributes = c("ensembl_gene_id", "entrezgene_id"),
+                            filters = c("ensembl_gene_id",
+                                        "with_entrezgene"),
+                            values = list("ensembl_gene_id" = colnames(bcc_grch38_list$grch38),
+                                         "with_entrezgene" = TRUE)) %>%
+  dplyr::filter(!is.na(entrezgene_id)) %>%
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+```
+
+Perform GO enrichment for each GO category, which account for molecular function, biological processes and cell components. Molecular functions define the activity of gene prodcuts, biological processes relate to the larger pathways which are made up of many molecular activities. Cell components relate to location related to the physical anatomy of the cell in which processes take place. This is a generalisation of the description given above during the enrichment analysis.
+
+```{r GO enrichment for each category}
+
+allMolFunction <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enrichGO(gene = list$entrezgene_id,
+         OrgDb = org.Hs.eg.db,
+         universe = as.character(universal$entrezgene_id),
+         ont = "MF",
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05,
+         readable = TRUE)
+})
+
+names(allMolFunction) <- unique(moduleGenes$module)
+
+allBiolProcesses <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enrichGO(gene = list$entrezgene_id,
+         OrgDb = org.Hs.eg.db,
+         universe = as.character(universal$entrezgene_id),
+         ont = "BP",
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05,
+         readable = TRUE)
+})
+
+names(allBiolProcesses) <- unique(moduleGenes$module)
+
+allCelComponents <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enrichGO(gene = list$entrezgene_id,
+         OrgDb = org.Hs.eg.db,
+         universe = as.character(universal$entrezgene_id),
+         ont = "CC",
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05,
+         readable = TRUE)
+})
+
+names(allCelComponents) <- unique(moduleGenes$module)
+
+```
+
+
+The Molecular Signatures Database (MsigDB) is a collection of annotated gene sets that are subdivided into [8 major collections](https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp). Of these, five collections are used which are the:
+
+* hallmark gene sets (H)
+:   The hallmark gene sets represent well characterised expression signatures representing well-defined biological states or processes.
+
+* curated gene sets (C2)
+:   The curated gene sets are assembled from online pathway databases and the knowledge of domain experts.
+
+* motif gene sets (C3)
+:   Gene sets representing potential targets of regulation by transcription factors or microRNAs
+
+* GO gene (C5)
+:   Gene sets that contain genes annotated by the same GO term
+
+For the curated gene sets, also create two different subsets, one which will only contain **KEGG** pathways and another with only pathways from **REACTOME**
+Our first step is to retireve dataframes for each subdivision
+
+
+```{r define databases}
+
+m_df_H <- msigdbr(species = "Homo sapiens", category = "H")
+m_df_C2 <- msigdbr(species = "Homo sapiens", category = "C2")
+m_df_C3 <- msigdbr(species = "Homo sapiens", category = "C3")
+m_df_C5 <- msigdbr(species = "Homo sapiens", category = "C5")
+genesets <- list(m_df_H, m_df_C2, m_df_C3, m_df_C5) %>% set_names(c("m_df_H", "m_df_C2", "m_df_C3", "m_df_C5"))
+
+```
+
+Take entire curated gene set, entire motif gene set, curated gene set, entire GO gene set, curated gene set, REACTOME and KEGGA pathways from the curated set, and all hallmark genes
+
+```{r define genesets}
+
+genesets <- lapply(genesets, function(x){
+  dplyr::select(.data = x, gs_name, entrez_gene) %>%
+    as.data.frame
+})
+
+genesets$m_df_C2KEGG <- m_df_C2 %>% 
+  dplyr::select(gs_name, entrez_gene) %>% 
+  dplyr::filter(str_detect(gs_name, "KEGG_")) %>%
+  as.data.frame()
+
+genesets$m_df_C2R <- m_df_C2 %>% 
+  dplyr::select(gs_name, entrez_gene) %>% 
+  dplyr::filter(str_detect(gs_name, "REACTOME_")) %>%
+  as.data.frame()
+
+```
+
+Establish a gene background of all the expressed genes found within the term placenta groups.
+
+```{r define background set and msigdb enrichment}
+
+background <- geneIDs %>%
+  distinct(entrezgene_id, .keep_all = TRUE) %>%
+  mutate(entrezgene_id = as.character(entrezgene_id))
+
+
+```
+
+Perform enrichment for each module with module genes using all curated gene sets, KEGG curated gene sets, REACTOME curated gene sets, and all hallmark gene sets. The pathway enrichment is basically retrieving those pathways which are the most common, or enriched, in the module gene sets. The purpose of the test to to retrieve the most enriched and statistically significant pathways. The enrichment of gene pathways using the hallmark gene set from *MsigDB* represents well defined biological functions while the curated gene set enrichment contains genes assembled from online databases and based off the knowledge of experts. Two curated sets are enriched for `KEGG` and `REACTOME` pathway sets.
+
+```{r module enrichment}
+
+allC2sets <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enricher(gene = list$entrezgene_id,
+         universe = as.character(universal$entrezgene),
+         TERM2GENE = genesets$m_df_C2,
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05)
+})
+
+names(allC2sets) <- unique(moduleGenes$module)
+
+allC2KEGGsets <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enricher(gene = list$entrezgene_id,
+         universe = as.character(universal$entrezgene),
+         TERM2GENE = genesets$m_df_C2KEGG,
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05)
+})
+
+names(allC2KEGGsets) <- unique(moduleGenes$module)
+
+allHallmarkSets <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enricher(gene = list$entrezgene_id,
+         universe = as.character(universal$entrezgene),
+         TERM2GENE = genesets$m_df_H,
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05)
+})
+
+names(allHallmarkSets) <- unique(moduleGenes$module)
+
+allC2Rsets <- lapply(unique(moduleGenes$module), function(x){
+  list <- dplyr::filter(moduleGenes, module == x)
+  enricher(gene = list$entrezgene_id,
+         universe = as.character(universal$entrezgene),
+         TERM2GENE = genesets$m_df_C2R,
+         pAdjustMethod = "BH",
+         pvalueCutoff = 0.01,
+         qvalueCutoff = 0.05)
+})
+
+names(allC2Rsets) <- unique(moduleGenes$module)
+
+```
+
+Form list of `REACTOME` enriched pathways and print the resulting supplementary table
+
+```{r REACTOME list}
+ReactomeList <- lapply(unique(moduleGenes$module), function(x){
+  as.data.frame(allC2Rsets[[x]]) %>%
+    tibble::rownames_to_column(var = "Set") %>%
+    dplyr::select(Set, GeneRatio, qvalue) %>%
+    mutate(Set = gsub("^REACTOME_", "", Set))
+})
+names(ReactomeList) <- unique(moduleGenes$module)
+ReactomeList <- reshape2::melt(ReactomeList) %>%
+  dplyr::select(`Reactome Gene Set` = Set, Module = L1, Qvalue = value)
+pander(head(ReactomeList, n = 100), split.table = Inf)
+```
+
+Form list of `HALLMARK` enriched pathways and print the resulting supplementary table
+
+```{r HALLMARK list}
+
+HallmarkList <- lapply(unique(moduleGenes$module), function(x){
+  as.data.frame(allHallmarkSets[[x]]) %>%
+    tibble::rownames_to_column(var = "Set") %>%
+    dplyr::select(Set, GeneRatio, qvalue) %>%
+    mutate(Set = gsub("^HALLMARK_", "", Set))
+})
+names(HallmarkList) <- unique(moduleGenes$module)
+HallmarkList <- reshape2::melt(HallmarkList) %>%
+  dplyr::select(`Hallmark Gene Set` = Set, Module = L1, Qvalue = value)
+pander(head(HallmarkList, n = 100), split.table = Inf)
+
+```
+
+Form list of `KEGG` enriched pathways and print the resulting supplementary table
+
+```{r KEGG list}
+
+KEGGmarkList <- lapply(unique(moduleGenes$module), function(x){
+  as.data.frame(allC2KEGGsets[[x]]) %>%
+    tibble::rownames_to_column(var = "Set") %>%
+    dplyr::select(Set, GeneRatio, qvalue) %>%
+    mutate(Set = gsub("^KEGG_", "", Set))
+})
+names(KEGGmarkList) <- unique(moduleGenes$module)
+KEGGmarkList <- reshape2::melt(KEGGmarkList) %>%
+  dplyr::select(`KEGG Gene Set` = Set, Module = L1, Qvalue = value)
+pander(head(KEGGmarkList, n = 100), split.table = Inf)
+
+```
+
+
+```{r session info}
+sessionInfo()
+```
